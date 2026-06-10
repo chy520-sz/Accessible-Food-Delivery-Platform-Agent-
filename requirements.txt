@@ -1,0 +1,30 @@
+# ==================== Web 框架 ====================
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.19
+
+# ==================== HTTP 客户端（含异步支持） ====================
+httpx==0.28.1
+
+# ==================== LangChain 生态 ====================
+langchain==0.3.14
+langchain-community==0.3.14
+langchain-core==0.3.29
+langchain-openai==0.3.0
+
+# ==================== 语音合成 ====================
+# edge-tts: 微软免费 TTS，无需 API Key
+edge-tts==6.1.15
+
+# ==================== 工具库 ====================
+pydantic>=2.10
+pydantic-core>=2.27
+python-dotenv==1.0.1
+tenacity==9.0.0
+
+# ==================== RAG 知识检索 ====================
+# Chroma 向量数据库 + LangChain 集成
+langchain-chroma>=0.2.0
+chromadb>=0.5.0
+# 本地中文嵌入模型（免费，无需 API Key，首次下载约 100MB）
+sentence-transformers>=3.0.0
