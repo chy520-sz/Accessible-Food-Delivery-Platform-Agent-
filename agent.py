@@ -3,11 +3,12 @@
 
 核心架构:
   - 使用 DeepSeek (deepseek-chat) 作为推理引擎
-  - 11 个核心工具函数供 LLM 调用（底层调用 Java 后端 API）
+  - 27 个工具函数供 LLM 调用（底层调用 Java 后端 API）
   - 会话级记忆管理，每个用户独立对话历史
   - 多智能体协同：导购 → 商家接单 → 配送，以函数串联展示
 
 工具列表（供 LLM 调用）:
+  外卖点餐:
   1. search_dishes     - 搜索菜品
   2. get_cart          - 查看购物车
   3. add_to_cart       - 加入购物车
@@ -18,7 +19,15 @@
   8. get_dish_detail   - 查看菜品详情
   9. clear_cart        - 清空购物车
   10. estimate_dish_nutrition - 估算菜品营养
-  11. simulate_multi_agent - 多智能体协同演示
+  11. simulate_multi_agent - 多智能体协同演示（仅演示）
+  健康管理（需后端健康 API 支持）:
+  12. record_health_profile - 录入健康档案
+  13. check_health_profile  - 查看健康档案
+  14. record_weight         - 记录体重
+  15. view_weight_history   - 查看体重历史
+  16. generate_diet_plan    - AI生成饮食计划
+  17. view_diet_plan        - 查看饮食计划
+  18. view_diet_plan_history- 饮食计划历史
 """
 import json
 import logging
@@ -75,12 +84,30 @@ from tools import (
     place_order as _place_order,
     get_shop_status as _get_shop_status,
     estimate_dish_nutrition as _estimate_dish_nutrition,
-    get_dish_nutrition as _get_dish_nutrition,
     agent_accept_order as _agent_accept_order,
     agent_start_delivery as _agent_start_delivery,
     agent_complete_order as _agent_complete_order,
     set_session,
     get_session,
+)
+# 健康管理工具（依赖 Java 后端 /api/user/health/* 接口，调用失败时有容错处理）
+from health_tools import (
+    save_health_profile as _save_health_profile,
+    get_health_profile as _get_health_profile,
+    record_weight as _record_weight,
+    get_weight_history as _get_weight_history,
+    save_diet_plan as _save_diet_plan,
+    get_active_diet_plan as _get_active_diet_plan,
+    get_diet_plan_history as _get_diet_plan_history,
+    fetch_dishes_for_planning as _fetch_dishes_for_planning,
+    fetch_dietary_rules_for_goal as _fetch_dietary_rules_for_goal,
+)
+from health_validator import (
+    validate_health_profile,
+    calculate_bmi,
+    normalize_activity_level,
+    normalize_diet_preference,
+    normalize_health_goal,
 )
 
 # ==================== 会话管理 ====================
@@ -285,13 +312,6 @@ def _create_tools(session_id: str):
         return _estimate_dish_nutrition(dish_name, dish_desc)
 
     @tool
-    def get_dish_nutrition(dish_id: int) -> str:
-        """获取某个菜品的营养信息（热量、蛋白质、脂肪等）。需要在登录后使用。
-        参数 dish_id: 菜品ID数字
-        """
-        return _get_dish_nutrition(session_id, dish_id)
-
-    @tool
     def simulate_multi_agent(order_summary: str) -> str:
         """【演示用】模拟多智能体协同工作流程：导购Agent → 商家接单Agent → 配送Agent。
         参数 order_summary: 订单摘要文本
@@ -358,6 +378,109 @@ def _create_tools(session_id: str):
         from config import RAG_COLLECTION_FAQ, RAG_TOP_K
         return search_knowledge(query, RAG_COLLECTION_FAQ, top_k=RAG_TOP_K)
 
+    # ==================== 健康管理工具 ====================
+    # ⚠️ 注意：以下工具依赖 Java 后端 /api/user/health/* 接口。
+    # 如果后端健康管理 API 尚未实现，工具调用会返回友好的错误提示，
+    # 不会影响点餐核心流程。
+
+    @tool
+    def record_health_profile(
+        age: int, gender: str, height: float, weight: float,
+        activity_level: str, diet_preference: str, health_goal: str,
+    ) -> str:
+        """录入或更新用户的健康档案。保存前先校验数值范围。
+        参数 age: 年龄（10-100）
+        参数 gender: 性别（男或女）
+        参数 height: 身高（厘米，100-250）
+        参数 weight: 体重（公斤，30-200）
+        参数 activity_level: 活动水平（低/中/高）
+        参数 diet_preference: 饮食偏好（均衡/低脂/素食/高蛋白/低碳水）
+        参数 health_goal: 健康目标（减肥/增肌/维持）
+        """
+        result = validate_health_profile(
+            age=age, gender=gender, height=height, weight=weight,
+            activity_level=activity_level, diet_preference=diet_preference,
+            health_goal=health_goal,
+        )
+        if not result.valid:
+            return '{"action": "error", "message": "' + result.message + '"}'
+        n = result.normalized
+        return _save_health_profile(
+            session_id, n["age"], n["gender"], n["height"], n["weight"],
+            n["activity_level"], n["diet_preference"], n["health_goal"],
+        )
+
+    @tool
+    def check_health_profile() -> str:
+        """查看当前用户的健康档案。包含年龄、性别、身高、体重、活动水平、饮食偏好、健康目标。"""
+        return _get_health_profile(session_id)
+
+    @tool
+    def record_weight(weight: float, record_date: str = "") -> str:
+        """记录用户当前体重。
+        参数 weight: 体重（公斤，30-200）
+        参数 record_date: 日期（yyyy-MM-dd），不填默认今天
+        """
+        if weight < 30 or weight > 200:
+            return '{"action": "error", "message": "体重需在30到200公斤之间"}'
+        return _record_weight(session_id, weight, record_date)
+
+    @tool
+    def view_weight_history(weeks: int = 12) -> str:
+        """查看体重历史记录。
+        参数 weeks: 最近几周，默认12周
+        """
+        return _get_weight_history(session_id, weeks)
+
+    @tool
+    def generate_diet_plan() -> str:
+        """根据健康档案和体重趋势，从本平台已有菜品库中选取真实菜品，生成一周个性化饮食计划。
+        生成前自动检查档案是否存在，并从数据库和知识库获取可用菜品及饮食规则。
+        所有菜品均来自本平台，绝不编造不存在的食物。"""
+        profile_str = _get_health_profile(session_id)
+        try:
+            p = json.loads(profile_str)
+            if p.get("action") == "profile_not_found":
+                return json.dumps(
+                    {"action": "error", "message": "请先录入健康档案，对我说'录入健康档案'"},
+                    ensure_ascii=False
+                )
+            if p.get("action") == "error":
+                return profile_str
+        except json.JSONDecodeError:
+            return json.dumps({"action": "error", "message": "获取档案出错，请重试"}, ensure_ascii=False)
+
+        # 获取体重历史（最近4周）
+        weight_str = _get_weight_history(session_id, weeks=4)
+
+        # 获取本平台已有菜品（优先 Java 后端，回退知识库 JSON）
+        dishes_str = _fetch_dishes_for_planning(session_id)
+
+        # 获取饮食规则（从知识库中匹配健康目标）
+        profile_data = p.get("profile", {})
+        health_goal = profile_data.get("health_goal", "维持")
+        dietary_rules_str = _fetch_dietary_rules_for_goal(health_goal)
+
+        from diet_planner import generate_weekly_diet_plan
+        return generate_weekly_diet_plan(
+            profile_str=profile_str,
+            weight_history_str=weight_str,
+            dishes_str=dishes_str,
+            dietary_rules_str=dietary_rules_str,
+        )
+
+    @tool
+    def view_diet_plan() -> str:
+        """查看当前有效的周饮食计划。"""
+        return _get_active_diet_plan(session_id)
+
+    @tool
+    def view_diet_plan_history(limit: int = 5) -> str:
+        """查看饮食计划历史。
+        参数 limit: 最近几条，默认5条
+        """
+        return _get_diet_plan_history(session_id, limit)
+
     return [
         login,
         search_dishes,
@@ -373,7 +496,6 @@ def _create_tools(session_id: str):
         place_order,
         get_shop_status,
         estimate_dish_nutrition,
-        get_dish_nutrition,
         simulate_multi_agent,
         merchant_accept_order,
         delivery_pickup_order,
@@ -381,6 +503,13 @@ def _create_tools(session_id: str):
         search_food_knowledge,       # RAG: 美食知识库检索
         search_dietary_knowledge,    # RAG: 饮食健康知识库检索
         search_faq,                  # RAG: 常见问题知识库检索
+        record_health_profile,       # 健康: 录入档案
+        check_health_profile,        # 健康: 查看档案
+        record_weight,               # 健康: 记录体重
+        view_weight_history,         # 健康: 体重历史
+        generate_diet_plan,          # 健康: AI生成饮食计划
+        view_diet_plan,              # 健康: 查看饮食计划
+        view_diet_plan_history,      # 健康: 饮食计划历史
     ]
 
 
