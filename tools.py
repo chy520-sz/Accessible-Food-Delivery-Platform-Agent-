@@ -1,148 +1,20 @@
 """
 工具函数模块 —— 封装对 Java 后端 API 的 HTTP 调用。
 
-所有需要认证的请求自动携带当前会话的 JWT token。
-使用 tenacity 库实现失败自动重试，提升视障用户交互稳定性。
+所有需要认证的请求自动携带当前会话的 JWT token；统一走 backend_client。
+重试策略：GET 查询可安全重试；下单/加购/评分等变更操作不重试（防重复提交）。
 """
-import json
 import time
 from typing import Optional
 
-import httpx
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+import backend_client as bc
 
-from config import JAVA_BASE_URL, MAX_RETRIES, RETRY_DELAY, CALORIE_ESTIMATE_MAP, SSL_VERIFY, AGENT_API_KEY
-
-
-# ==================== 会话级 JWT Token 存储 ====================
-# key: session_id (str) → value: dict { "token", "user_id", "username", "expires_at" }
-_session_store: dict[str, dict] = {}
+from config import AGENT_API_KEY, CALORIE_ESTIMATE_MAP
 
 
-def set_session(session_id: str, data: dict) -> None:
-    """将 JWT 登录信息存入会话。"""
-    _session_store[session_id] = data
-
-
-def get_session(session_id: str) -> dict | None:
-    """获取会话信息，若过期则自动清除并返回 None。"""
-    sess = _session_store.get(session_id)
-    if not sess:
-        return None
-    # 检查是否过期
-    if time.time() > sess.get("expires_at", 0):
-        _session_store.pop(session_id, None)
-        return None
-    return sess
-
-
-def _get_auth_headers(session_id: str) -> dict[str, str]:
-    """构造带 Bearer token 的 Authorization 请求头。"""
-    sess = get_session(session_id)
-    if not sess:
-        raise PermissionError("用户未登录或登录已过期，请先登录。")
-    return {"Authorization": f"Bearer {sess['token']}", "Content-Type": "application/json"}
-
-
-# ==================== 底层 HTTP 请求封装 ====================
-
-def _is_retryable_error(exception: BaseException) -> bool:
-    """判断异常是否可重试（网络超时、5xx 服务端错误可重试，4xx 不可重试）。"""
-    if isinstance(exception, httpx.TimeoutException):
-        return True
-    if isinstance(exception, httpx.HTTPStatusError):
-        return 500 <= exception.response.status_code < 600
-    if isinstance(exception, httpx.ConnectError):
-        return True
-    return False
-
-
-@retry(
-    stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_fixed(RETRY_DELAY),
-    retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError)),
-    reraise=True,
-)
-def _get(path: str, session_id: str, params: dict | None = None) -> dict:
-    """发送 GET 请求到 Java 后端，自动重试。"""
-    url = f"{JAVA_BASE_URL}{path}"
-    headers = _get_auth_headers(session_id)
-    # Content-Type 头只对 POST/PUT 有意义，GET 去掉
-    headers.pop("Content-Type", None)
-    with httpx.Client(verify=SSL_VERIFY, timeout=15.0) as client:
-        resp = client.get(url, headers=headers, params=params)
-        resp.raise_for_status()
-        return resp.json()
-
-
-@retry(
-    stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_fixed(RETRY_DELAY),
-    retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError)),
-    reraise=True,
-)
-def _post(path: str, session_id: str, body: dict | None = None) -> dict:
-    """发送 POST 请求到 Java 后端，自动重试。"""
-    url = f"{JAVA_BASE_URL}{path}"
-    headers = _get_auth_headers(session_id)
-    with httpx.Client(verify=SSL_VERIFY, timeout=15.0) as client:
-        resp = client.post(url, headers=headers, json=body)
-        resp.raise_for_status()
-        return resp.json()
-
-
-@retry(
-    stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_fixed(RETRY_DELAY),
-    retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError)),
-    reraise=True,
-)
-def _put(path: str, session_id: str, body: dict | None = None) -> dict:
-    """发送 PUT 请求到 Java 后端，自动重试。"""
-    url = f"{JAVA_BASE_URL}{path}"
-    headers = _get_auth_headers(session_id)
-    with httpx.Client(verify=SSL_VERIFY, timeout=15.0) as client:
-        resp = client.put(url, headers=headers, json=body)
-        resp.raise_for_status()
-        return resp.json()
-
-
-@retry(
-    stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_fixed(RETRY_DELAY),
-    retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError)),
-    reraise=True,
-)
-def _delete(path: str, session_id: str) -> dict:
-    """发送 DELETE 请求到 Java 后端，自动重试。"""
-    url = f"{JAVA_BASE_URL}{path}"
-    headers = _get_auth_headers(session_id)
-    headers.pop("Content-Type", None)
-    with httpx.Client(verify=SSL_VERIFY, timeout=15.0) as client:
-        resp = client.delete(url, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
-
-
-def _extract_data(result: dict) -> object:
-    """从 Java 统一响应 {code, message, data} 中提取 data 字段。
-    如果 code != 200 则抛出异常，便于上层感知业务错误。
-    """
-    code = result.get("code", -1)
-    if code != 200:
-        msg = result.get("message", "未知错误")
-        raise RuntimeError(f"Java 后端返回错误 (code={code}): {msg}")
-    return result.get("data")
-
-
-def _extract_records(data: object) -> list:
-    """兼容 Java 后端直接返回列表或分页对象两种结构。"""
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        records = data.get("records")
-        return records if isinstance(records, list) else []
-    return []
+# 兼容旧引用：agent.py 仍从 tools 导入 set_session / get_session
+set_session = bc.set_session
+get_session = bc.get_session
 
 
 # ==================== LangChain 工具函数 ====================
@@ -159,28 +31,21 @@ def login(session_id: str, phone: str, password: str) -> str:
     返回:
         登录结果描述，包含用户名和用户ID。
     """
-    # 登录接口不需要认证，直接请求
-    url = f"{JAVA_BASE_URL}/api/auth/user/login"
     try:
-        with httpx.Client(verify=SSL_VERIFY, timeout=10.0) as client:
-            resp = client.post(url, json={"phone": phone, "password": password})
-            resp.raise_for_status()
-            result = resp.json()
-            if result.get("code") != 200:
-                return f"登录失败：{result.get('message', '未知错误')}"
-            data = result["data"]
-            # 存入会话：token 有效期约 7 天，这里按 30 分钟做会话过期
-            set_session(session_id, {
-                "token": data["token"],
-                "user_id": data["id"],
-                "username": data["username"],
-                "expires_at": time.time() + 1800,
-            })
-            return f"登录成功！欢迎 {data['username']}，您的用户ID是 {data['id']}。"
-    except httpx.HTTPStatusError as e:
-        return f"登录请求失败（HTTP {e.response.status_code}），请检查账号密码。"
-    except httpx.ConnectError:
-        return "无法连接到外卖后端服务，请确保服务已启动。"
+        result = bc.post_public("/api/auth/user/login", {
+            "phone": phone, "password": password,
+        })
+        if result.get("code") != 200:
+            return f"登录失败：{result.get('message', '未知错误')}"
+        data = result["data"]
+        # 存入会话：token 有效期约 30 分钟（与 Java 端 access-expiration 一致）
+        set_session(session_id, {
+            "token": data["token"],
+            "user_id": data["id"],
+            "username": data["username"],
+            "expires_at": time.time() + 1800,
+        })
+        return f"登录成功！欢迎 {data['username']}，您的用户ID是 {data['id']}。"
     except Exception as e:
         return f"登录时发生异常：{str(e)}"
 
@@ -203,8 +68,8 @@ def search_dishes(session_id: str, keyword: str = "", category_id: Optional[int]
     if category_id is not None:
         params["categoryId"] = category_id
     try:
-        result = _get("/api/user/dishes", session_id, params=params)
-        dishes = _extract_records(_extract_data(result))
+        result = bc.get("/api/user/dishes", session_id, params=params)
+        dishes = bc.extract_records(bc.extract_data(result))
         if not dishes:
             keyword_hint = f"关于{keyword}的" if keyword else " "
             return f"没有找到{keyword_hint}菜品。您可以换个关键词试试，或者告诉我想吃什么口味的，我帮您推荐。"
@@ -244,8 +109,8 @@ def get_dish_detail(session_id: str, dish_id: int) -> str:
         菜品详情文本。
     """
     try:
-        result = _get(f"/api/user/dishes/{dish_id}", session_id)
-        d = _extract_data(result)
+        result = bc.get(f"/api/user/dishes/{dish_id}", session_id)
+        d = bc.extract_data(result)
         if not d:
             return f"未找到ID为 {dish_id} 的菜品。"
         lines = [
@@ -268,8 +133,8 @@ def get_dish_detail(session_id: str, dish_id: int) -> str:
 def recommend_dishes(session_id: str, limit: int = 5) -> str:
     """根据用户历史评分、平均分、评分数量、销量和时间衰减推荐菜品。"""
     try:
-        result = _get("/api/user/recommendations/dishes", session_id, params={"limit": limit})
-        dishes = _extract_data(result)
+        result = bc.get("/api/user/recommendations/dishes", session_id, params={"limit": limit})
+        dishes = bc.extract_data(result)
         if not dishes:
             return "暂时没有可推荐的菜品。您可以告诉我想吃什么口味，我再帮您查找。"
         lines = ["根据您的历史评分偏好，为您推荐："]
@@ -303,8 +168,8 @@ def rate_item(session_id: str, target_type: str, target_id: int, score: int, com
             "score": score,
             "comment": comment,
         }
-        result = _post("/api/user/ratings", session_id, body)
-        rating = _extract_data(result)
+        result = bc.post("/api/user/ratings", session_id, body)
+        rating = bc.extract_data(result)
         return (
             f"评分已提交：{rating.get('targetType')} ID {rating.get('targetId')}，"
             f"{rating.get('score')}星。"
@@ -318,9 +183,9 @@ def rate_item(session_id: str, target_type: str, target_id: int, score: int, com
 def get_my_rating_history(session_id: str, limit: int = 10) -> str:
     """查询当前用户最近的评分历史。"""
     try:
-        result = _get("/api/user/ratings/mine", session_id, params={"page": 1, "pageSize": limit})
-        data = _extract_data(result)
-        records = _extract_records(data)
+        result = bc.get("/api/user/ratings/mine", session_id, params={"page": 1, "pageSize": limit})
+        data = bc.extract_data(result)
+        records = bc.extract_records(data)
         if not records:
             return "您还没有评分记录。用餐后可以给菜品、套餐或店铺打一到五星。"
         lines = ["您最近的评分记录："]
@@ -344,8 +209,8 @@ def get_cart(session_id: str) -> str:
         购物车内容文本。
     """
     try:
-        result = _get("/api/user/cart", session_id)
-        items = _extract_data(result)
+        result = bc.get("/api/user/cart", session_id)
+        items = bc.extract_data(result)
         if not items or (isinstance(items, list) and len(items) == 0):
             return "您的购物车是空的。对我说'帮我推荐一些菜品'来开始点餐吧。"
         lines = ["您的购物车："]
@@ -358,7 +223,7 @@ def get_cart(session_id: str) -> str:
             subtotal = float(price) * qty
             total += subtotal
             lines.append(f"  {i}. {name}（店铺:{shop}）× {qty}  ¥{price}/份  小计 ¥{subtotal:.2f}")
-        lines.append(f"  ——————————————")
+        lines.append("  ——————————————")
         lines.append(f"  合计: ¥{total:.2f}")
         return "\n".join(lines)
     except PermissionError as e:
@@ -380,7 +245,7 @@ def add_to_cart(session_id: str, dish_id: int, quantity: int = 1) -> str:
     """
     try:
         body = {"dishId": dish_id, "quantity": quantity}
-        _post("/api/user/cart", session_id, body)
+        bc.post("/api/user/cart", session_id, body)
         return f"已将 {quantity} 份菜品(ID:{dish_id})加入购物车。您可以继续选菜，或者对我说'去结算'。"
     except PermissionError as e:
         return str(e)
@@ -395,7 +260,7 @@ def clear_cart(session_id: str) -> str:
         操作结果文本。
     """
     try:
-        _delete("/api/user/cart", session_id)
+        bc.delete("/api/user/cart", session_id)
         return "购物车已清空。"
     except PermissionError as e:
         return str(e)
@@ -411,8 +276,8 @@ def get_user_orders(session_id: str) -> str:
         订单列表文本。
     """
     try:
-        result = _get("/api/user/orders", session_id)
-        orders = _extract_data(result)
+        result = bc.get("/api/user/orders", session_id)
+        orders = bc.extract_data(result)
         if not orders or (isinstance(orders, list) and len(orders) == 0):
             return "您还没有任何订单。对我说'我想点餐'来开始吧。"
         lines = [f"您共有 {len(orders)} 笔订单："]
@@ -449,8 +314,8 @@ def get_user_addresses(session_id: str) -> str:
         地址列表文本。
     """
     try:
-        result = _get("/api/user/addresses", session_id)
-        addrs = _extract_data(result)
+        result = bc.get("/api/user/addresses", session_id)
+        addrs = bc.extract_data(result)
         if not addrs or (isinstance(addrs, list) and len(addrs) == 0):
             return "您还没有保存收货地址。请告诉我您的收货地址（如'XX路XX号'），我来帮您下单。"
         lines = ["您的收货地址："]
@@ -469,6 +334,7 @@ def get_user_addresses(session_id: str) -> str:
 def place_order(session_id: str, address_id: int, remark: str = "") -> str:
     """提交下单。
     系统会自动从购物车读取菜品并计算总价，下单后购物车自动清空。
+    此操作**不自动重试**，避免网络抖动导致重复下单。
 
     参数:
         address_id: 收货地址ID数字（需先通过 get_user_addresses 获取）
@@ -481,8 +347,8 @@ def place_order(session_id: str, address_id: int, remark: str = "") -> str:
         body = {"addressId": address_id}
         if remark:
             body["remark"] = remark
-        result = _post("/api/user/orders", session_id, body)
-        order = _extract_data(result)
+        result = bc.post("/api/user/orders", session_id, body)
+        order = bc.extract_data(result)
         order_no = order.get("orderNo", "未知")
         total = order.get("totalPrice", 0)
         status = order.get("status", "pending")
@@ -499,140 +365,21 @@ def place_order(session_id: str, address_id: int, remark: str = "") -> str:
         return f"下单失败：{str(e)}"
 
 
-def get_dish_nutrition(session_id: str, dish_id: int) -> str:
-    """获取菜品的营养估算信息。
-    调用 Java 后端的营养估算接口，返回热量、蛋白质、脂肪等数据。
-    数据基于菜品名称估算，仅供参考。
-
-    参数:
-        dish_id: 菜品ID数字
-
-    返回:
-        营养信息文本。
-    """
-    try:
-        result = _get(f"/api/user/dishes/{dish_id}/nutrition", session_id)
-        nutrition = _extract_data(result)
-        if not nutrition:
-            return f"未找到菜品(ID:{dish_id})的营养信息。"
-        lines = [f"「{nutrition.get('dishName', '未知')}」营养估算："]
-        for key, label in [("calories", "热量"), ("protein", "蛋白质"), ("fat", "脂肪")]:
-            val = nutrition.get(key, "")
-            if val:
-                lines.append(f"  {label}: {val}")
-        note = nutrition.get("note", "")
-        if note:
-            lines.append(f"  ⚠ {note}")
-        return "\n".join(lines)
-    except PermissionError as e:
-        return str(e)
-    except Exception as e:
-        return f"获取营养信息失败：{str(e)}"
-
-
-def agent_accept_order(order_id: int, user_id: int) -> str:
-    """【多智能体-商家接单】模拟商家确认订单并开始备餐。
-    使用 Agent API Key 认证，无需用户 JWT。
-
-    参数:
-        order_id: 订单ID
-        user_id: 用户ID
-
-    返回:
-        接单结果描述。
-    """
-    url = f"{JAVA_BASE_URL}/api/agent/orders/{order_id}/accept"
-    try:
-        with httpx.Client(verify=SSL_VERIFY, timeout=10.0) as client:
-            resp = client.post(
-                url,
-                headers={"X-Agent-Key": AGENT_API_KEY, "Content-Type": "application/json"},
-                json={"userId": user_id},
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
-            return (
-                f"商家已接单！订单编号 {data.get('orderNo', 'N/A')}\n"
-                f"预计 {data.get('prepTimeMin', 20)} 分钟出餐，请耐心等待～"
-            )
-    except Exception as e:
-        return f"商家接单失败：{str(e)}"
-
-
-def agent_start_delivery(order_id: int, user_id: int) -> str:
-    """【多智能体-配送开始】模拟配送员取餐并开始配送。
-
-    参数:
-        order_id: 订单ID
-        user_id: 用户ID
-
-    返回:
-        配送信息描述。
-    """
-    url = f"{JAVA_BASE_URL}/api/agent/orders/{order_id}/deliver"
-    try:
-        with httpx.Client(verify=SSL_VERIFY, timeout=10.0) as client:
-            resp = client.post(
-                url,
-                headers={"X-Agent-Key": AGENT_API_KEY, "Content-Type": "application/json"},
-                json={"userId": user_id},
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
-            return (
-                f"配送员 {data.get('riderName', 'N/A')} 已取餐！\n"
-                f"预计 {data.get('deliveryTimeMin', 25)} 分钟送达。\n"
-                f"配送员电话: {data.get('riderPhone', 'N/A')}（如有需要可联系）"
-            )
-    except Exception as e:
-        return f"配送启动失败：{str(e)}"
-
-
-def agent_complete_order(order_id: int, user_id: int) -> str:
-    """【多智能体-配送完成】标记订单已送达。
-
-    参数:
-        order_id: 订单ID
-        user_id: 用户ID
-
-    返回:
-        完成信息描述。
-    """
-    url = f"{JAVA_BASE_URL}/api/agent/orders/{order_id}/complete"
-    try:
-        with httpx.Client(verify=SSL_VERIFY, timeout=10.0) as client:
-            resp = client.post(
-                url,
-                headers={"X-Agent-Key": AGENT_API_KEY, "Content-Type": "application/json"},
-                json={"userId": user_id},
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
-            return data.get("message", "订单已送达，祝您用餐愉快！")
-    except Exception as e:
-        return f"订单完成失败：{str(e)}"
-
-
 def get_shop_status() -> str:
     """查询店铺当前营业状态（无需登录）。
 
     返回:
         店铺是否在营业的描述。
     """
-    url = f"{JAVA_BASE_URL}/api/shop/status"
     try:
-        with httpx.Client(verify=SSL_VERIFY, timeout=10.0) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            result = resp.json()
-            if result.get("code") != 200:
-                return f"无法获取店铺状态：{result.get('message', '未知错误')}"
-            data = result["data"]
-            is_open = data.get("isOpen", 0)
-            if is_open == 1:
-                return "店铺正在营业中，可以正常下单。"
-            else:
-                return "店铺当前已打烊，暂时无法下单。请稍后再来，或提前选好菜品等营业后再下单。"
+        result = bc.get_public("/api/shop/status")
+        if result.get("code") != 200:
+            return f"无法获取店铺状态：{result.get('message', '未知错误')}"
+        data = result["data"]
+        is_open = data.get("isOpen", 0)
+        if is_open == 1:
+            return "店铺正在营业中，可以正常下单。"
+        return "店铺当前已打烊，暂时无法下单。请稍后再来，或提前选好菜品等营业后再下单。"
     except Exception as e:
         return f"查询店铺状态失败：{str(e)}"
 
@@ -669,7 +416,154 @@ def estimate_dish_nutrition(dish_name: str, dish_desc: str = "") -> str:
     lines = [
         f"「{dish_name}」营养估算（仅供参考）：",
         f"  每份预估热量: 约 {avg_cal}~{total_cal} 千卡",
-        f"  匹配依据: " + "、".join(matched_keywords),
-        f"温馨提示：如果您有特殊饮食需求（如低盐、低糖、过敏等），请告知我，我帮您筛选合适的菜品。",
+        "  匹配依据: " + "、".join(matched_keywords),
+        "温馨提示：如果您有特殊饮食需求（如低盐、低糖、过敏等），请告知我，我帮您筛选合适的菜品。",
     ]
     return "\n".join(lines)
+
+
+# ==================== Agent 桥接（商家接单 / 配送 / 订单状态） ====================
+# 这些接口要求同时携带用户 JWT（证明操作者是本人）与 X-Agent-Key（证明调用方是 Agent）。
+
+def agent_accept_order(session_id: str, order_id: int, user_id: int) -> str:
+    """【多智能体-商家接单】确认订单并开始备餐（真实调用 Java 后端）。
+    使用用户 JWT + Agent API Key 双重认证。
+
+    参数:
+        session_id: 当前会话ID
+        order_id: 订单ID
+        user_id: 用户ID
+
+    返回:
+        接单结果描述。
+    """
+    headers = {"X-Agent-Key": AGENT_API_KEY, "Content-Type": "application/json"}
+    try:
+        result = bc.post(
+            f"/api/agent/orders/{order_id}/accept",
+            session_id,
+            body={"userId": user_id},
+            extra_headers=headers,
+        )
+        data = bc.extract_data(result)
+        return (
+            f"商家已接单！订单编号 {data.get('orderNo', 'N/A')}\n"
+            f"预计 {data.get('prepTimeMin', 20)} 分钟出餐，请耐心等待～"
+        )
+    except PermissionError as e:
+        return str(e)
+    except Exception as e:
+        return f"商家接单失败：{str(e)}"
+
+
+def agent_start_delivery(session_id: str, order_id: int, user_id: int) -> str:
+    """【多智能体-配送开始】标记订单进入配送状态（真实调用 Java 后端）。
+
+    参数:
+        session_id: 当前会话ID
+        order_id: 订单ID
+        user_id: 用户ID
+
+    返回:
+        配送信息描述（基于后端真实返回，不编造骑手信息）。
+    """
+    headers = {"X-Agent-Key": AGENT_API_KEY, "Content-Type": "application/json"}
+    try:
+        result = bc.post(
+            f"/api/agent/orders/{order_id}/deliver",
+            session_id,
+            body={"userId": user_id},
+            extra_headers=headers,
+        )
+        data = bc.extract_data(result)
+        order_no = data.get("orderNo", "N/A")
+        rider_phone = data.get("riderPhone")
+        if rider_phone:
+            return (
+                f"配送员已取餐，正在为您配送！订单编号 {order_no}\n"
+                f"配送员电话：{rider_phone}（脱敏显示）"
+            )
+        if data.get("message"):
+            return f"订单 {order_no}：{data['message']}"
+        return f"订单 {order_no} 已进入配送状态，正在等待骑手接单。"
+    except PermissionError as e:
+        return str(e)
+    except Exception as e:
+        return f"配送启动失败：{str(e)}"
+
+
+def agent_complete_order(session_id: str, order_id: int, user_id: int) -> str:
+    """【多智能体-配送完成】标记订单已送达（真实调用 Java 后端）。
+
+    参数:
+        session_id: 当前会话ID
+        order_id: 订单ID
+        user_id: 用户ID
+
+    返回:
+        完成信息描述。
+    """
+    headers = {"X-Agent-Key": AGENT_API_KEY, "Content-Type": "application/json"}
+    try:
+        result = bc.post(
+            f"/api/agent/orders/{order_id}/complete",
+            session_id,
+            body={"userId": user_id},
+            extra_headers=headers,
+        )
+        data = bc.extract_data(result)
+        return data.get("message", "订单已送达，祝您用餐愉快！")
+    except PermissionError as e:
+        return str(e)
+    except Exception as e:
+        return f"订单完成失败：{str(e)}"
+
+
+def agent_get_order_status(session_id: str, order_id: int) -> str:
+    """查询订单的真实配送状态（真实调用 Java 后端）。
+
+    参数:
+        session_id: 当前会话ID
+        order_id: 订单ID
+
+    返回:
+        订单编号、状态、骑手分配情况、关键时间点等真实信息。
+    """
+    headers = {"X-Agent-Key": AGENT_API_KEY}
+    try:
+        result = bc.get(
+            f"/api/agent/orders/{order_id}/status",
+            session_id,
+            extra_headers=headers,
+        )
+        d = bc.extract_data(result)
+        status_map = {
+            "pending": "待接单", "accepted": "商家已接单",
+            "delivering": "配送中", "completed": "已完成", "cancelled": "已取消",
+        }
+        order_no = d.get("orderNo", "N/A")
+        status = status_map.get(d.get("status"), d.get("status", "未知"))
+        delivery_status = d.get("deliveryStatus", "")
+        lines = [
+            f"订单 {order_no} 当前状态：{status}",
+            f"  配送状态: {delivery_status or '未分配'}",
+        ]
+        if d.get("riderAssigned"):
+            phone = d.get("riderPhone")
+            lines.append(f"  骑手已接单，联系电话：{phone or '未知'}")
+        else:
+            lines.append("  暂未分配骑手，正在等待接单。")
+        for label, key in [
+            ("预计送达", "scheduledDeliveryTime"),
+            ("分配时间", "assignedAt"),
+            ("取餐时间", "pickedUpAt"),
+            ("送达时间", "deliveredAt"),
+        ]:
+            val = d.get(key)
+            if val:
+                lines.append(f"  {label}: {val[:19]}")
+        return "\n".join(lines)
+    except PermissionError as e:
+        return str(e)
+    except Exception as e:
+        return f"查询订单状态失败：{str(e)}"

@@ -18,7 +18,6 @@ LLM 的角色: 从已有菜品中选择 + 排列，绝不编造不存在的菜�
 import json
 import logging
 import re
-from typing import Optional
 
 logger = logging.getLogger("diet_planner")
 
@@ -355,6 +354,7 @@ def generate_weekly_diet_plan(profile_str: str, weight_history_str: str, dishes_
     # 10. 构建返回
     summary = plan_obj.pop("plan_summary", "")
     nutrition_notes = plan_obj.pop("nutrition_notes", "此计划全部来自本平台真实菜品，仅供参考。")
+    tts_summary = format_plan_for_tts(json.dumps({"plan": plan_obj}, ensure_ascii=False))
 
     return json.dumps({
         "action": "diet_plan",
@@ -364,6 +364,7 @@ def generate_weekly_diet_plan(profile_str: str, weight_history_str: str, dishes_
         "dish_source": "本平台菜品库",
         "message": summary or f"已为您生成{health_goal}饮食计划，每日约{calories['target']}千卡",
         "nutrition_notes": nutrition_notes,
+        "tts_text": tts_summary,
     }, ensure_ascii=False)
 
 
@@ -464,17 +465,16 @@ def _fallback_plan(candidate_dishes: list[dict], calories: dict, profile: dict) 
 
 def _call_llm_for_plan(prompt: str) -> str:
     """调用 DeepSeek LLM 从菜品池中选菜并生成计划 JSON。"""
-    import httpx
     from langchain_openai import ChatOpenAI
     from langchain_core.messages import HumanMessage
     from config import (
         DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, LLM_MODEL,
-        LLM_REQUEST_TIMEOUT, MAX_LLM_TOKENS, SSL_VERIFY,
+        LLM_REQUEST_TIMEOUT, MAX_LLM_TOKENS,
     )
+    from llm_client import get_http_clients
 
-    timeout = httpx.Timeout(LLM_REQUEST_TIMEOUT, connect=10.0)
-    http_client = httpx.Client(verify=SSL_VERIFY, timeout=timeout)
-    async_http_client = httpx.AsyncClient(verify=SSL_VERIFY, timeout=timeout)
+    # 复用共享 httpx 客户端，避免每次生成计划都新建连接池
+    http_client, async_http_client = get_http_clients()
 
     llm = ChatOpenAI(
         model=LLM_MODEL, temperature=0.3, max_tokens=MAX_LLM_TOKENS * 2,

@@ -114,7 +114,7 @@ def _get_embedding_model():
         print(f"[RAG] 使用本地模型: {local_path}")
         model = SentenceTransformer(local_path)
         _embedding_model = _STEmbeddings(model)
-        print(f"[RAG] 嵌入模型加载完成。")
+        print("[RAG] 嵌入模型加载完成。")
         return _embedding_model
 
     # 1. 尝试 ModelScope
@@ -155,7 +155,7 @@ def _get_embedding_model():
     try:
         model = SentenceTransformer(model_path)
         _embedding_model = _STEmbeddings(model)
-        print(f"[RAG] 嵌入模型加载完成。")
+        print("[RAG] 嵌入模型加载完成。")
         return _embedding_model
     except ImportError:
         raise RuntimeError(
@@ -256,7 +256,7 @@ def search_knowledge(
         docs = store.similarity_search_with_score(query, k=top_k)
     except Exception as e:
         print(f"[RAG] 检索异常: {e}")
-        return f"知识库检索时出现异常，请稍后再试。"
+        return "知识库检索时出现异常，请稍后再试。"
 
     # 3. 格式化结果
     if not docs:
@@ -303,16 +303,3 @@ def search_knowledge(
         )
 
     return "\n".join(lines)
-
-
-def is_knowledge_base_ready() -> bool:
-    """检查知识库是否已构建并可用。
-
-    返回:
-        True 表示至少有一个集合包含数据
-    """
-    for collection in ["dish_knowledge", "dietary_knowledge", "faq"]:
-        store = _get_vector_store(collection)
-        if store is not None:
-            return True
-    return False

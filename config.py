@@ -3,10 +3,24 @@
 请复制 .env.example 为 .env 并填入您的真实凭据。
 """
 import os
+import sys
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _enable_utf8_stdout() -> None:
+    """Windows 控制台默认 GBK 编码，直接 print 中文/emoji 可能崩溃；
+    统一切换为 UTF-8 容错编码。"""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+_enable_utf8_stdout()
 
 # Python 3.14 + httpcore SSL 兼容性问题，本地开发环境关闭 SSL 验证
 # (DeepSeek API 和 Java 后端都是本地/内网环境)
@@ -58,11 +72,43 @@ LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 
 # ==================== Agent API Key ====================
 # 用于 Agent 调用 Java 后端专用接口（如模拟商家接单/配送），请设置为复杂随机字符串
+# 注意：该值必须与 Java 后端 application.yml 的 agent.api-key（或环境变量 AGENT_API_KEY）一致
 AGENT_API_KEY = os.getenv("AGENT_API_KEY", "change-me-in-production")
+
+# ==================== Agent 服务对外鉴权 ====================
+# 客户端调用 /agent/* 时需携带 X-Agent-Key 请求头。
+# 留空表示开发模式（不校验）；生产环境请务必设置，并同步配置前端 VITE_AGENT_KEY。
+AGENT_SERVICE_API_KEY = os.getenv("AGENT_SERVICE_API_KEY", "")
+
+# CORS 允许来源（逗号分隔）。不再使用 "*"。
+_DEFAULT_CORS_ORIGINS = (
+    "http://localhost:3000,http://localhost:5173,http://localhost:5174,"
+    "http://localhost:5175,http://127.0.0.1:3000,http://127.0.0.1:5173,"
+    "http://127.0.0.1:5174,http://127.0.0.1:5175"
+)
+AGENT_CORS_ORIGINS = [
+    o.strip() for o in os.getenv("AGENT_CORS_ORIGINS", _DEFAULT_CORS_ORIGINS).split(",")
+    if o.strip()
+]
+
+# 语音上传大小上限（默认 10MB）
+AGENT_MAX_AUDIO_BYTES = int(os.getenv("AGENT_MAX_AUDIO_BYTES", str(10 * 1024 * 1024)))
+
+# 每个来源 IP 每分钟最多请求数（覆盖 /agent/*，健康检查除外）
+AGENT_RATE_LIMIT_PER_MINUTE = int(os.getenv("AGENT_RATE_LIMIT_PER_MINUTE", "120"))
+
+# 启动时是否开启 uvicorn reload（生产环境应关闭）
+AGENT_RELOAD = os.getenv("AGENT_RELOAD", "false").lower() in ("1", "true", "yes")
 
 # ==================== 重试配置 ====================
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_DELAY = float(os.getenv("RETRY_DELAY", "0.5"))
+
+# ==================== 健康探活与会话清理 ====================
+# LLM 健康状态缓存有效期（秒），期间不重复真调大模型
+LLM_HEALTH_TTL = int(os.getenv("LLM_HEALTH_TTL", "300"))
+# 过期会话清理任务的执行间隔（秒）
+SESSION_CLEANUP_INTERVAL = int(os.getenv("SESSION_CLEANUP_INTERVAL", "60"))
 
 # ==================== RAG 知识库配置 ====================
 # 向量数据库持久化目录
@@ -94,15 +140,23 @@ def _validate_config():
     warnings = []
     if not DEEPSEEK_API_KEY:
         warnings.append("DEEPSEEK_API_KEY 未设置 —— LLM 调用将全部失败")
+    if AGENT_API_KEY == "change-me-in-production":
+        warnings.append(
+            "AGENT_API_KEY 仍为默认值 —— 请设置为与 Java 后端 agent.api-key 一致的复杂随机字符串"
+        )
+    if not AGENT_SERVICE_API_KEY:
+        warnings.append(
+            "AGENT_SERVICE_API_KEY 未设置 —— /agent/* 接口处于开发模式（不校验调用方身份），生产环境请务必配置"
+        )
     if not ALIYUN_ACCESS_KEY_ID:
         warnings.append("ALIYUN_ACCESS_KEY_ID 未设置 —— 语音识别将不可用")
     if not ALIYUN_ACCESS_KEY_SECRET:
         warnings.append("ALIYUN_ACCESS_KEY_SECRET 未设置 —— 语音识别将不可用")
     if warnings:
-        print("[config] ⚠️  配置警告:")
+        print("[config] [WARN] 配置警告:")
         for w in warnings:
             print(f"  - {w}")
     else:
-        print("[config] ✅ 关键配置检查通过")
+        print("[config] [OK] 关键配置检查通过")
 
 _validate_config()

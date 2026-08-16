@@ -10,9 +10,11 @@ TTS: 使用 edge-tts 免费合成，无需 API Key，支持丰富的中文音色
   - Token 获取: https://help.aliyun.com/document_detail/450514.html
 """
 import base64
+import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -27,10 +29,11 @@ from config import (
     ASR_WS_URL,
     TTS_VOICE,
     TTS_RATE,
-    TTS_OUTPUT_DIR,
     MAX_RETRIES,
     RETRY_DELAY,
 )
+
+logger = logging.getLogger("speech")
 
 # ==================== 凭据校验 ====================
 
@@ -99,7 +102,7 @@ def _get_aliyun_token() -> str:
             token = token_info.get("Id", "")
             expire = token_info.get("ExpireTime", now + 86400)
             if not token:
-                raise RuntimeError(f"Token 响应为空，请检查 AccessKey 是否有效")
+                raise RuntimeError("Token 响应为空，请检查 AccessKey 是否有效")
             _token_cache["token"] = token
             _token_cache["expire_time"] = expire
             return token
@@ -254,7 +257,7 @@ async def recognize_speech(audio_bytes: bytes, audio_format: str = "pcm") -> str
                         break
                     elif name == "TaskFailed":
                         status_text = header.get("status_text", "未知错误")
-                        print(f"[ASR] 启动失败: {status_text}")
+                        logger.warning("[ASR] 启动失败: %s", status_text)
                         return ""
 
                 if not started:
@@ -293,25 +296,25 @@ async def recognize_speech(audio_bytes: bytes, audio_format: str = "pcm") -> str
                             result_text = msg.get("payload", {}).get("result", "")
                         else:
                             status_text = header.get("status_text", "未知错误")
-                            print(f"[ASR] 识别失败 (status={status}): {status_text}")
+                            logger.warning("[ASR] 识别失败 (status=%s): %s", status, status_text)
                         break
                     elif name == "RecognitionResultChanged":
                         pass
                     elif name == "TaskFailed":
                         status_text = header.get("status_text", "未知错误")
-                        print(f"[ASR] 任务失败: {status_text}")
+                        logger.warning("[ASR] 任务失败: %s", status_text)
                         break
 
             return result_text
 
         except websockets.exceptions.ConnectionClosed as e:
-            print(f"[ASR] WebSocket 连接关闭: {e}")
+            logger.warning("[ASR] WebSocket 连接关闭: %s", e)
             return ""
         except (OSError, ConnectionError) as e:
-            print(f"[ASR] 连接失败: {e}")
+            logger.warning("[ASR] 连接失败: %s", e)
             return ""
         except Exception as e:
-            print(f"[ASR] WebSocket 异常: {e}")
+            logger.warning("[ASR] WebSocket 异常: %s", e)
             return ""
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -319,7 +322,6 @@ async def recognize_speech(audio_bytes: bytes, audio_format: str = "pcm") -> str
         if text:
             return text.strip()
         if attempt < MAX_RETRIES:
-            import asyncio
             await asyncio.sleep(RETRY_DELAY)
 
     return ""
@@ -332,6 +334,7 @@ async def synthesize_speech(text: str) -> bytes:
 
     edge-tts 使用微软免费的 Azure TTS 引擎，提供自然流畅的中文语音。
     选用 zh-CN-XiaoxiaoNeural 音色（温暖活泼女声），语速稍慢适配视障用户。
+    使用 asyncio.create_subprocess_exec 异步执行，避免阻塞事件循环。
 
     参数:
         text: 要合成的文本内容
@@ -339,8 +342,6 @@ async def synthesize_speech(text: str) -> bytes:
     返回:
         MP3 格式的音频二进制数据。合成失败返回空字节。
     """
-    import io
-    import subprocess
     import tempfile
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -355,12 +356,24 @@ async def synthesize_speech(text: str) -> bytes:
                 "--text", text,
                 "--write-media", output_file,
             ]
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30,
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if result.returncode != 0:
-                err = result.stderr.strip()
-                print(f"[TTS] 合成失败 (第{attempt}次): {err}")
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                logger.warning("[TTS] 合成超时 (第%d次)", attempt)
+                _safe_remove(output_file)
+                if attempt >= MAX_RETRIES:
+                    return b""
+                continue
+            if proc.returncode != 0:
+                err = (stderr or b"").decode("utf-8", errors="replace").strip()
+                logger.warning("[TTS] 合成失败 (第%d次): %s", attempt, err)
                 _safe_remove(output_file)
                 if attempt < MAX_RETRIES:
                     continue
@@ -372,19 +385,17 @@ async def synthesize_speech(text: str) -> bytes:
                 _safe_remove(output_file)
                 return audio_data
             else:
-                print(f"[TTS] 输出文件未生成 (第{attempt}次)")
+                logger.warning("[TTS] 输出文件未生成 (第%d次)", attempt)
                 if attempt >= MAX_RETRIES:
                     return b""
 
-        except subprocess.TimeoutExpired:
-            print(f"[TTS] 合成超时 (第{attempt}次)")
         except FileNotFoundError:
             raise RuntimeError(
                 "未找到 edge-tts 命令。请先安装: pip install edge-tts\n"
                 "参考: https://github.com/rany2/edge-tts"
             )
         except Exception as e:
-            print(f"[TTS] 异常: {e} (第{attempt}次)")
+            logger.warning("[TTS] 异常: %s (第%d次)", e, attempt)
             if attempt >= MAX_RETRIES:
                 return b""
     return b""

@@ -2,36 +2,14 @@
 智能 Agent 核心模块 —— LangChain AgentExecutor + ConversationBufferMemory。
 
 核心架构:
-  - 使用 DeepSeek (deepseek-chat) 作为推理引擎
-  - 27 个工具函数供 LLM 调用（底层调用 Java 后端 API）
-  - 会话级记忆管理，每个用户独立对话历史
-  - 多智能体协同：导购 → 商家接单 → 配送，以函数串联展示
-
-工具列表（供 LLM 调用）:
-  外卖点餐:
-  1. search_dishes     - 搜索菜品
-  2. get_cart          - 查看购物车
-  3. add_to_cart       - 加入购物车
-  4. get_user_orders   - 查看历史订单
-  5. get_user_addresses- 查看收货地址
-  6. place_order       - 提交下单
-  7. get_shop_status   - 查询店铺状态
-  8. get_dish_detail   - 查看菜品详情
-  9. clear_cart        - 清空购物车
-  10. estimate_dish_nutrition - 估算菜品营养
-  11. simulate_multi_agent - 多智能体协同演示（仅演示）
-  健康管理（需后端健康 API 支持）:
-  12. record_health_profile - 录入健康档案
-  13. check_health_profile  - 查看健康档案
-  14. record_weight         - 记录体重
-  15. view_weight_history   - 查看体重历史
-  16. generate_diet_plan    - AI生成饮食计划
-  17. view_diet_plan        - 查看饮食计划
-  18. view_diet_plan_history- 饮食计划历史
+  - 使用 DeepSeek (deepseek-chat) 作为推理引擎（共享 LLM 单例）
+  - 29 个工具函数供 LLM 调用（底层调用 Java 后端 API）
+  - 会话级记忆管理，每个用户独立对话历史，定期清理过期会话
+  - 多智能体协同：导购 → 商家接单 → 配送，桥接工具真实调用 Java 后端
 """
 import json
 import logging
-import re
+import time
 import traceback
 import uuid
 from typing import Optional
@@ -40,18 +18,23 @@ from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.memory import ConversationBufferMemory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
 
+import backend_client as bc
 from config import (
-    DEEPSEEK_API_KEY,
-    DEEPSEEK_BASE_URL,
+    JAVA_BASE_URL,
+    LLM_HEALTH_TTL,
     LLM_MODEL,
-    LLM_REQUEST_TIMEOUT,
-    LLM_TEMPERATURE,
-    MAX_LLM_TOKENS,
     SESSION_EXPIRE_SECONDS,
-    SSL_VERIFY,
 )
+from llm_client import (
+    close_llm,
+    get_llm,
+    llm_healthy,
+    mark_llm_failure,
+    mark_llm_success,
+    probe_llm,
+)
+from text_utils import clean_text_for_tts
 
 # 修复[错误分级]：配置结构化日志，记录完整上下文用于排障
 logging.basicConfig(
@@ -62,8 +45,6 @@ logging.basicConfig(
 logger = logging.getLogger("agent")
 from prompts import (
     XIAOLU_SYSTEM_PROMPT,
-    MULTI_AGENT_FLOW,
-    WELCOME_MESSAGE,
     MERCHANT_AGENT_PROMPT,
     DELIVERY_AGENT_PROMPT,
 )
@@ -87,6 +68,7 @@ from tools import (
     agent_accept_order as _agent_accept_order,
     agent_start_delivery as _agent_start_delivery,
     agent_complete_order as _agent_complete_order,
+    agent_get_order_status as _agent_get_order_status,
     set_session,
     get_session,
 )
@@ -102,13 +84,8 @@ from health_tools import (
     fetch_dishes_for_planning as _fetch_dishes_for_planning,
     fetch_dietary_rules_for_goal as _fetch_dietary_rules_for_goal,
 )
-from health_validator import (
-    validate_health_profile,
-    calculate_bmi,
-    normalize_activity_level,
-    normalize_diet_preference,
-    normalize_health_goal,
-)
+from health_validator import validate_health_profile
+
 
 # ==================== 会话管理 ====================
 
@@ -122,6 +99,7 @@ class AgentSession:
 
     def __init__(self, session_id: str):
         self.session_id = session_id
+        self.last_active = time.time()
         self.memory = ConversationBufferMemory(
             memory_key="chat_history",
             return_messages=True,
@@ -148,6 +126,7 @@ def get_or_create_session(session_id: Optional[str] = None) -> AgentSession:
     """
     if session_id and session_id in _sessions:
         sess = _sessions[session_id]
+        sess.last_active = time.time()
         # 检查 JWT 是否过期
         if get_session(session_id) or not sess.logged_in:
             return sess
@@ -161,32 +140,21 @@ def get_or_create_session(session_id: Optional[str] = None) -> AgentSession:
     return sess
 
 
-# ==================== LLM 初始化 ====================
-
-def _create_llm() -> ChatOpenAI:
-    """创建 DeepSeek LLM 实例，通过 DeepSeek API 调用。
-
-    DeepSeek 提供与 OpenAI 兼容的 API 端点，
-    因此可以直接使用 langchain-openai 的 ChatOpenAI 类。
-    """
-    import httpx
-
-    # 修复[LLM超时]：为 httpx 客户端设置与 LLM_REQUEST_TIMEOUT 一致的超时，防止 AgentExecutor
-    # 长链工具调用被过早截断。同步/异步客户端均需配置，否则默认超时可能仅 5-10 秒。
-    timeout = httpx.Timeout(LLM_REQUEST_TIMEOUT, connect=10.0)
-    http_client = httpx.Client(verify=SSL_VERIFY, timeout=timeout)
-    async_http_client = httpx.AsyncClient(verify=SSL_VERIFY, timeout=timeout)
-    return ChatOpenAI(
-        model=LLM_MODEL,
-        temperature=LLM_TEMPERATURE,
-        max_tokens=MAX_LLM_TOKENS,
-        api_key=DEEPSEEK_API_KEY,
-        base_url=DEEPSEEK_BASE_URL,
-        streaming=False,
-        request_timeout=LLM_REQUEST_TIMEOUT,
-        http_client=http_client,
-        http_async_client=async_http_client,
-    )
+def cleanup_sessions(now: Optional[float] = None) -> int:
+    """清理超过 SESSION_EXPIRE_SECONDS 未活动的会话及其 token，返回清理数量。"""
+    now = time.time() if now is None else now
+    expired = [
+        sid for sid, sess in _sessions.items()
+        if now - sess.last_active > SESSION_EXPIRE_SECONDS
+    ]
+    for sid in expired:
+        sess = _sessions.pop(sid, None)
+        if sess is not None:
+            sess.agent_executor = None  # 释放 executor/memory 引用
+    bc.purge_expired_sessions(now)
+    if expired:
+        logger.info("[session_cleanup] 清理过期会话 %d 个", len(expired))
+    return len(expired)
 
 
 # ==================== LangChain 工具定义 ====================
@@ -313,34 +281,45 @@ def _create_tools(session_id: str):
 
     @tool
     def simulate_multi_agent(order_summary: str) -> str:
-        """【演示用】模拟多智能体协同工作流程：导购Agent → 商家接单Agent → 配送Agent。
+        """【仅演示】模拟多智能体协同工作流程（导购Agent → 商家接单Agent → 配送Agent）。
+        生成的是虚构演示数据（演示订单号/骑手/时间均为随机编造）。
+        仅当用户明确要求观看"演示""展示"多智能体流程时使用；
+        真实订单的进度必须使用 query_order_status 查询。
         参数 order_summary: 订单摘要文本
         """
         return _simulate_multi_agent_flow(order_summary)
 
     @tool
     def merchant_accept_order(order_id: int, user_id: int) -> str:
-        """【多智能体演示】商家接单Agent：确认订单并开始备餐。
+        """【真实桥接】商家接单Agent：确认订单并开始备餐，真实调用 Java 后端。
         参数 order_id: 订单ID
         参数 user_id: 用户ID
         """
-        return _agent_accept_order(order_id, user_id)
+        return _agent_accept_order(session_id, order_id, user_id)
 
     @tool
     def delivery_pickup_order(order_id: int, user_id: int) -> str:
-        """【多智能体演示】配送Agent：配送员取餐开始配送。
+        """【真实桥接】配送Agent：标记订单进入配送状态，真实调用 Java 后端。
         参数 order_id: 订单ID
         参数 user_id: 用户ID
         """
-        return _agent_start_delivery(order_id, user_id)
+        return _agent_start_delivery(session_id, order_id, user_id)
 
     @tool
     def delivery_complete_order(order_id: int, user_id: int) -> str:
-        """【多智能体演示】配送Agent：订单已送达。
+        """【真实桥接】配送Agent：订单已送达，真实调用 Java 后端。
         参数 order_id: 订单ID
         参数 user_id: 用户ID
         """
-        return _agent_complete_order(order_id, user_id)
+        return _agent_complete_order(session_id, order_id, user_id)
+
+    @tool
+    def query_order_status(order_id: int) -> str:
+        """查询订单的真实配送状态（是否接单、骑手分配、预计送达、关键时间点）。
+        用户询问"订单到哪了""什么时候送到""帮我查一下订单进度"时使用。
+        参数 order_id: 订单ID
+        """
+        return _agent_get_order_status(session_id, order_id)
 
     # ==================== RAG 知识库检索工具 ====================
 
@@ -434,7 +413,8 @@ def _create_tools(session_id: str):
 
     @tool
     def generate_diet_plan() -> str:
-        """根据健康档案和体重趋势，从本平台已有菜品库中选取真实菜品，生成一周个性化饮食计划。
+        """根据健康档案和体重趋势，从本平台已有菜品库中选取真实菜品，生成一周个性化饮食计划，
+        生成后自动保存到后端（如后端已实现健康接口）。
         生成前自动检查档案是否存在，并从数据库和知识库获取可用菜品及饮食规则。
         所有菜品均来自本平台，绝不编造不存在的食物。"""
         profile_str = _get_health_profile(session_id)
@@ -462,12 +442,35 @@ def _create_tools(session_id: str):
         dietary_rules_str = _fetch_dietary_rules_for_goal(health_goal)
 
         from diet_planner import generate_weekly_diet_plan
-        return generate_weekly_diet_plan(
+        plan_result = generate_weekly_diet_plan(
             profile_str=profile_str,
             weight_history_str=weight_str,
             dishes_str=dishes_str,
             dietary_rules_str=dietary_rules_str,
         )
+
+        # 生成成功后自动保存到后端（后端未实现时不影响返回计划内容）
+        try:
+            plan_obj = json.loads(plan_result)
+            if isinstance(plan_obj, dict) and plan_obj.get("action") == "diet_plan" and plan_obj.get("plan"):
+                saved = _save_diet_plan(
+                    session_id,
+                    json.dumps(plan_obj["plan"], ensure_ascii=False),
+                )
+                try:
+                    saved_obj = json.loads(saved)
+                    if saved_obj.get("action") == "diet_plan_saved":
+                        plan_obj["message"] = f"{plan_obj.get('message', '')}（计划已保存）"
+                    else:
+                        plan_obj["message"] = (
+                            f"{plan_obj.get('message', '')}（保存提示：{saved_obj.get('message', '')}）"
+                        )
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                plan_result = json.dumps(plan_obj, ensure_ascii=False)
+        except json.JSONDecodeError:
+            pass
+        return plan_result
 
     @tool
     def view_diet_plan() -> str:
@@ -500,6 +503,7 @@ def _create_tools(session_id: str):
         merchant_accept_order,
         delivery_pickup_order,
         delivery_complete_order,
+        query_order_status,
         search_food_knowledge,       # RAG: 美食知识库检索
         search_dietary_knowledge,    # RAG: 饮食健康知识库检索
         search_faq,                  # RAG: 常见问题知识库检索
@@ -527,7 +531,7 @@ def _create_agent_executor(
     返回:
         配置好的 AgentExecutor
     """
-    llm = _create_llm()
+    llm = get_llm()
     tools = _create_tools(session_id)
 
     # 构造 ChatPromptTemplate —— create_tool_calling_agent 要求的标准格式
@@ -560,14 +564,13 @@ def _create_agent_executor(
     return executor
 
 
-# ==================== 多智能体协同模拟 ====================
+# ==================== 多智能体协同模拟（仅演示） ====================
 
 def _simulate_multi_agent_flow(order_summary: str) -> str:
-    """模拟三智能体协同流程：导购 → 商家接单 → 配送。
+    """模拟三智能体协同流程：导购 → 商家接单 → 配送（虚构演示数据）。
 
-    此函数用于在作品中生动展示多智能体协作概念。
-    实际生产环境中，商家接单和配送状态由 Java 后端管理，
-    Agent 通过查询订单状态接口获取最新进展。
+    此函数仅用于演示多智能体协作概念，返回的订单号/骑手/时间均为随机编造。
+    真实订单的进度必须通过 query_order_status 工具查询 Java 后端。
 
     参数:
         order_summary: 导购Agent确认后的订单摘要
@@ -586,7 +589,7 @@ def _simulate_multi_agent_flow(order_summary: str) -> str:
 
     lines = [
         "══════════════════════════",
-        "🐾  多智能体协同流程演示  🐾",
+        "🐾  多智能体协同流程演示（虚构数据）  🐾",
         "══════════════════════════",
         "",
         "【第一步】🛍️  导购Agent（小鹿）",
@@ -600,8 +603,8 @@ def _simulate_multi_agent_flow(order_summary: str) -> str:
         f"  {DELIVERY_AGENT_PROMPT.strip().format(delivery_time=delivery_time, rider_name=rider_name, rider_phone=rider_phone)}",
         "",
         "══════════════════════════",
-        f"  订单 {order_no} 全流程追踪完毕",
-        "  小鹿将持续为您跟进订单状态～",
+        f"  演示订单 {order_no} 全流程展示完毕",
+        "  如需查询真实订单进度，请对我说'查一下我的订单'",
         "══════════════════════════",
     ]
     return "\n".join(lines)
@@ -609,10 +612,25 @@ def _simulate_multi_agent_flow(order_summary: str) -> str:
 
 # ==================== 登录态同步 ====================
 
+def _decode_jwt_payload(auth_token: str) -> Optional[dict]:
+    """base64 解码 JWT payload（仅用于读取展示字段，签名由后端验证）。"""
+    import base64
+    try:
+        payload_b64 = auth_token.split(".")[1]
+        missing_padding = (4 - len(payload_b64) % 4) % 4
+        payload_b64 += "=" * missing_padding
+        return json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+    except Exception as e:
+        logger.warning("[sync_login] JWT payload 解码失败: %s", type(e).__name__)
+        return None
+
+
 def sync_login_token(session_id: str, auth_token: Optional[str]) -> tuple[bool, str]:
     """将前端登录态同步到 Agent 会话（免密码复用登录态）。
 
     处理三种场景：首次登录、换号、退出登录。
+    安全说明：token 的签名/过期/黑名单状态由 Java 后端真实校验
+    （validate_user_token），Agent 不信任客户端直接传来的 payload。
 
     参数:
         session_id: 会话ID
@@ -621,41 +639,45 @@ def sync_login_token(session_id: str, auth_token: Optional[str]) -> tuple[bool, 
     返回:
         (是否已登录, 用户名)
     """
-    import base64, json, time
-
     sess = _sessions.get(session_id)
     if not sess:
-        print(f"[sync_login] 会话 {session_id} 不存在")
+        logger.warning("[sync_login] 会话 %s 不存在", session_id)
         return False, ""
 
     stored = get_session(session_id)
 
     if auth_token:
         if not stored or stored.get("token") != auth_token:
-            try:
-                payload_b64 = auth_token.split(".")[1]
-                missing_padding = (4 - len(payload_b64) % 4) % 4
-                payload_b64 += "=" * missing_padding
-                payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
-                print(f"[sync_login] JWT载荷: {json.dumps(payload, ensure_ascii=False)}")
-                set_session(session_id, {
-                    "token": auth_token,
-                    "user_id": payload.get("userId") or payload.get("sub", 0),
-                    "username": payload.get("username", "用户"),
-                    "expires_at": time.time() + 1800,
-                })
-                sess.logged_in = True
-                sess.username = payload.get("username", "用户")
-                print(f"[sync_login] 会话 {session_id} 登录成功: username={sess.username}, userId={payload.get('userId') or payload.get('sub')}")
-            except Exception as e:
-                print(f"[sync_login] 会话 {session_id} JWT解码失败: {e}, token前20字符={auth_token[:20]}")
+            payload = _decode_jwt_payload(auth_token)
+            if payload is None:
+                return False, ""
+            # 后端真实校验（验签 + 过期 + 黑名单）
+            if not bc.validate_user_token(auth_token):
+                logger.warning("[sync_login] 会话 %s token 后端校验未通过", session_id)
+                return False, ""
+            now = time.time()
+            expires_at = now + SESSION_EXPIRE_SECONDS
+            exp = payload.get("exp")
+            if isinstance(exp, (int, float)) and exp > now:
+                expires_at = min(expires_at, exp)
+            set_session(session_id, {
+                "token": auth_token,
+                "user_id": payload.get("userId") or payload.get("sub", 0),
+                "username": payload.get("username", "用户"),
+                "expires_at": expires_at,
+            })
+            sess.logged_in = True
+            sess.username = payload.get("username", "用户")
+            logger.info(
+                "[sync_login] 会话 %s 登录成功: username=%s",
+                session_id, sess.username,
+            )
         else:
-            print(f"[sync_login] 会话 {session_id} token未变化，跳过")
-        print(f"[sync_login] 会话 {session_id} 最终状态: logged_in={sess.logged_in}, username={sess.username}")
+            logger.info("[sync_login] 会话 %s token未变化，跳过", session_id)
         return sess.logged_in, sess.username
     else:
         # 前端无 token（用户退出登录）：清除 Agent 会话中的登录态
-        print(f"[sync_login] 会话 {session_id} 清除登录态")
+        logger.info("[sync_login] 会话 %s 清除登录态", session_id)
         if stored:
             set_session(session_id, {
                 "token": "", "user_id": 0, "username": "",
@@ -664,53 +686,6 @@ def sync_login_token(session_id: str, auth_token: Optional[str]) -> tuple[bool, 
             sess.logged_in = False
             sess.username = ""
         return False, ""
-
-
-# ==================== TTS 文本清理 ====================
-
-def clean_text_for_tts(text: str) -> str:
-    """清理文本，移除表情和 Markdown 符号，用于语音合成。
-    保留中文语义和自然停顿，去掉 TTS 会读出来的符号和表情。
-    """
-    # 移除 emoji（覆盖常见 Unicode 表情范围）
-    emoji_pattern = re.compile(
-        '['
-        '\U0001F600-\U0001F64F'   # 表情符号
-        '\U0001F300-\U0001F5FF'   # 杂项符号和象形文字
-        '\U0001F680-\U0001F6FF'   # 交通工具和地图
-        '\U0001F1E0-\U0001F1FF'   # 旗帜
-        '\U0001F900-\U0001F9FF'   # 补充符号和象形文字
-        '\U0001FA00-\U0001FA6F'   # 象棋符号
-        '\U0001FA70-\U0001FAFF'   # 符号扩展-A
-        '☀-➿'           # 杂项符号（包含 ☀⭐ 等）
-        '⭐'                   # ⭐
-        '️'                   # 变体选择器
-        '‍'                   # 零宽连接符
-        ']+', flags=re.UNICODE)
-    text = emoji_pattern.sub('', text)
-
-    # 移除 markdown 加粗 **text** → text
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-
-    # 移除 markdown 斜体标记
-    text = re.sub(r'\*(.+?)\*', r'\1', text)
-
-    # 移除 markdown 代码标记
-    text = re.sub(r'`(.+?)`', r'\1', text)
-
-    # 将 — （em dash）替换为逗号停顿
-    text = text.replace('—', '，')
-
-    # 将 # 标题标记去掉内容保留
-    text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
-
-    # 移除多余空格，保留换行作为停顿
-    text = re.sub(r'[ \t]+', ' ', text)
-
-    # 多个连续换行压缩为单个
-    text = re.sub(r'\n{3,}', '\n\n', text)
-
-    return text.strip()
 
 
 # ==================== 对话接口 ====================
@@ -726,14 +701,14 @@ async def chat(session_id: Optional[str], user_input: str, auth_token: Optional[
     返回:
         { "session_id": str, "reply": str, "is_new_session": bool }
     """
-    # 修复[错误分级]：每次请求生成唯一 trace_id，贯穿日志和错误响应，便于用户反馈时定位
+    # 每次请求生成唯一 trace_id，贯穿日志和错误响应
     trace_id = uuid.uuid4().hex[:12]
     is_new = session_id is None
+    sess = None
 
-    # 修复[根因]：将 get_or_create_session 移入 try 块内。此前该调用在 try 外部（原第547行），
-    # 若 AgentSession 初始化（LLM/httpx 创建）失败，异常直接逃逸到 FastAPI，导致无 trace_id 的 500。
     try:
         sess = get_or_create_session(session_id)
+        sess.last_active = time.time()
 
         # 同步前端登录态到 Agent 会话
         if auth_token and not sess.logged_in:
@@ -758,12 +733,13 @@ async def chat(session_id: Optional[str], user_input: str, auth_token: Optional[
         reply = result.get("output", "")
         if not reply or not reply.strip():
             reply = "抱歉呀，我刚才没有理解您的意思。能换个说法再告诉我一遍吗？小鹿在认真听呢～"
+        mark_llm_success()
 
     except Exception as e:
-        # 修复[错误分级]：不再简单截断错误消息，而是记录完整 traceback 到日志，
-        # 同时按错误类型分级返回用户友好的提示，并在回复末尾附加 trace_id 供反馈
+        # 记录完整 traceback，按错误类型分级返回用户友好的提示
         error_msg = str(e)
         error_type = type(e).__name__
+        mark_llm_failure()
         logger.error(
             "[chat] trace=%s session=%s ERROR type=%s msg=%s\n%s",
             trace_id,
@@ -773,7 +749,7 @@ async def chat(session_id: Optional[str], user_input: str, auth_token: Optional[
             traceback.format_exc(),
         )
 
-        # 修复[错误分级]：分类识别大模型 API 的错误类型，给出精确定向提示
+        # 分类识别大模型 API 的错误类型，给出精确定向提示
         error_lower = error_msg.lower()
         if "timeout" in error_lower or "timed out" in error_lower:
             reply = (
@@ -812,9 +788,9 @@ async def chat(session_id: Optional[str], user_input: str, auth_token: Optional[
             )
 
     tts_text = clean_text_for_tts(reply)
-
+    result_session_id = sess.session_id if sess else (session_id or "")
     return {
-        "session_id": sess.session_id,
+        "session_id": result_session_id,
         "reply": reply,
         "tts_text": tts_text,
         "is_new_session": is_new,
@@ -822,24 +798,48 @@ async def chat(session_id: Optional[str], user_input: str, auth_token: Optional[
     }
 
 
+# ==================== 健康状态 ====================
+
+_java_probe = {"ts": 0.0, "ok": False}
+_JAVA_PROBE_TTL = 30.0
+
+
+async def _probe_java_backend() -> bool:
+    """轻量探测 Java 后端（店铺状态公开接口，带 30 秒缓存）。"""
+    now = time.time()
+    if now - _java_probe["ts"] < _JAVA_PROBE_TTL:
+        return _java_probe["ok"]
+    try:
+        bc.get_public("/api/shop/status", timeout=3.0)
+        _java_probe.update(ts=now, ok=True)
+    except Exception:
+        _java_probe.update(ts=now, ok=False)
+    return _java_probe["ok"]
+
+
 async def get_agent_status() -> dict:
-    """获取 Agent 服务健康状态。
+    """获取 Agent 服务健康状态（基于缓存，不每次真调大模型）。
 
     返回:
-        { "status": "ok", "model": str, "active_sessions": int, ... }
+        { "status": str, "model": str, "active_sessions": int, ... }
     """
-    try:
-        llm = _create_llm()
-        # 发送一个极短的测试请求验证 LLM 连通性
-        test_msg = await llm.ainvoke("回复'OK'")
-        llm_alive = "OK" in test_msg.content
-    except Exception:
-        llm_alive = False
+    llm_alive = llm_healthy(LLM_HEALTH_TTL)
+    if not llm_alive:
+        # 从未探测或缓存失效时补一次探测（probe_llm 内部有节流）
+        llm_alive = await probe_llm(ttl=LLM_HEALTH_TTL)
+    java_ok = await _probe_java_backend()
 
     return {
         "status": "ok" if llm_alive else "degraded",
         "model": LLM_MODEL,
         "active_sessions": len(_sessions),
         "llm_connected": llm_alive,
-        "java_backend": "http://localhost:3000",
+        "java_backend": "up" if java_ok else "down",
+        "java_base_url": JAVA_BASE_URL,
     }
+
+
+def shutdown() -> None:
+    """释放全局资源（服务关闭时调用）。"""
+    close_llm()
+    bc.close_client()

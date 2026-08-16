@@ -1,12 +1,10 @@
 """
 健康管理工具函数 —— 封装对 Java 后端健康模块 API 的 HTTP 调用。
 
-所有需要认证的请求自动携带当前会话的 JWT token。
-使用 tenacity 实现失败自动重试。
+所有需要认证的请求自动携带当前会话的 JWT token；统一走 backend_client。
 
-⚠️ 注意：本模块依赖的 Java 后端健康管理 API（/api/user/health/*）
-当前可能在项目 B 后端中尚未实现。工具调用失败时会返回友好的错误提示，
-不影响点餐核心流程。
+⚠️ 注意：Java 后端健康管理 API（/api/user/health/*）当前可能尚未实现。
+工具调用失败时会返回友好的错误提示，不影响点餐核心流程。
 
 工具列表:
   - save_health_profile    — 保存/更新健康档案
@@ -19,71 +17,9 @@
 """
 
 import json
-from typing import Optional
+import os
 
-import httpx
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-
-from config import JAVA_BASE_URL, MAX_RETRIES, RETRY_DELAY, SSL_VERIFY
-
-
-# ==================== 会话 JWT 辅助 ====================
-
-def _get_auth_headers(session_id: str) -> dict[str, str]:
-    """从 tools.py 的会话存储中获取 Authorization 头。
-
-    注意：此函数依赖 tools.py 中维护的 _session_store，
-    确保 health_tools 与原有 tools 共享同一会话状态。
-    """
-    from tools import get_session as _get_session
-    sess = _get_session(session_id)
-    if not sess:
-        raise PermissionError("用户未登录或登录已过期，请先登录。")
-    return {"Authorization": f"Bearer {sess['token']}", "Content-Type": "application/json"}
-
-
-# ==================== HTTP 请求封装 ====================
-
-@retry(
-    stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_fixed(RETRY_DELAY),
-    retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError)),
-    reraise=True,
-)
-def _health_get(path: str, session_id: str, params: dict | None = None) -> dict:
-    """健康模块 GET 请求。"""
-    url = f"{JAVA_BASE_URL}{path}"
-    headers = _get_auth_headers(session_id)
-    headers.pop("Content-Type", None)
-    with httpx.Client(verify=SSL_VERIFY, timeout=15.0) as client:
-        resp = client.get(url, headers=headers, params=params)
-        resp.raise_for_status()
-        return resp.json()
-
-
-@retry(
-    stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_fixed(RETRY_DELAY),
-    retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError)),
-    reraise=True,
-)
-def _health_post(path: str, session_id: str, body: dict | None = None) -> dict:
-    """健康模块 POST 请求。"""
-    url = f"{JAVA_BASE_URL}{path}"
-    headers = _get_auth_headers(session_id)
-    with httpx.Client(verify=SSL_VERIFY, timeout=15.0) as client:
-        resp = client.post(url, headers=headers, json=body)
-        resp.raise_for_status()
-        return resp.json()
-
-
-def _extract_data(result: dict) -> object:
-    """从 Java 统一响应 {code, message, data} 中提取 data 字段。"""
-    code = result.get("code", -1)
-    if code != 200:
-        msg = result.get("message", "未知错误")
-        raise RuntimeError(f"Java 后端返回错误 (code={code}): {msg}")
-    return result.get("data")
+import backend_client as bc
 
 
 # ==================== 健康档案工具 ====================
@@ -122,9 +58,7 @@ def save_health_profile(
             "dietPreference": diet_preference,
             "healthGoal": health_goal,
         }
-        result = _health_post("/api/user/health/profile", session_id, body)
-        data = _extract_data(result)
-        # 构建 JSON 结构化输出供前端解析
+        bc.post("/api/user/health/profile", session_id, body)
         output = {
             "action": "profile_save",
             "profile": {
@@ -159,8 +93,8 @@ def get_health_profile(session_id: str) -> str:
         健康档案文本（JSON 格式）或未找到提示
     """
     try:
-        result = _health_get("/api/user/health/profile", session_id)
-        data = _extract_data(result)
+        result = bc.get("/api/user/health/profile", session_id)
+        data = bc.extract_data(result)
         if not data:
             return json.dumps(
                 {"action": "profile_not_found", "message": "您还没有创建健康档案。对我说'录入健康档案'来开始吧。"},
@@ -207,8 +141,8 @@ def record_weight(session_id: str, weight: float, record_date: str = "") -> str:
         body = {"weight": weight}
         if record_date:
             body["recordDate"] = record_date
-        result = _health_post("/api/user/health/weight", session_id, body)
-        data = _extract_data(result)
+        result = bc.post("/api/user/health/weight", session_id, body)
+        data = bc.extract_data(result)
         record_date_str = data.get("recordDate", "今天")
         output = {
             "action": "weight_recorded",
@@ -233,8 +167,8 @@ def get_weight_history(session_id: str, weeks: int = 12) -> str:
         体重历史列表（JSON 格式）
     """
     try:
-        result = _health_get("/api/user/health/weight", session_id, params={"weeks": weeks})
-        records = _extract_data(result)
+        result = bc.get("/api/user/health/weight", session_id, params={"weeks": weeks})
+        records = bc.extract_data(result)
         if not records or (isinstance(records, list) and len(records) == 0):
             return json.dumps(
                 {"action": "weight_history", "history": [], "message": "您还没有体重记录。对我说'记录体重'来开始吧。"},
@@ -282,8 +216,8 @@ def save_diet_plan(session_id: str, plan_data: str, week_start_date: str = "") -
         body = {"planData": plan_data}
         if week_start_date:
             body["weekStartDate"] = week_start_date
-        result = _health_post("/api/user/health/diet-plan", session_id, body)
-        data = _extract_data(result)
+        result = bc.post("/api/user/health/diet-plan", session_id, body)
+        data = bc.extract_data(result)
         output = {
             "action": "diet_plan_saved",
             "plan_id": data.get("id"),
@@ -303,8 +237,8 @@ def get_active_diet_plan(session_id: str) -> str:
         当前饮食计划 JSON 或未找到提示
     """
     try:
-        result = _health_get("/api/user/health/diet-plan/active", session_id)
-        data = _extract_data(result)
+        result = bc.get("/api/user/health/diet-plan/active", session_id)
+        data = bc.extract_data(result)
         if not data:
             return json.dumps(
                 {"action": "diet_plan", "plan": None, "message": "您还没有饮食计划。对我说'生成饮食计划'来开始吧。"},
@@ -329,6 +263,52 @@ def get_active_diet_plan(session_id: str) -> str:
         return json.dumps({"action": "error", "message": f"获取饮食计划失败：{str(e)}"}, ensure_ascii=False)
 
 
+def get_diet_plan_history(session_id: str, limit: int = 10) -> str:
+    """查询饮食计划历史列表。
+
+    参数:
+        limit: 返回条数，默认 10
+
+    返回:
+        饮食计划历史列表 JSON
+    """
+    try:
+        result = bc.get("/api/user/health/diet-plan/history", session_id, params={"limit": limit})
+        records = bc.extract_data(result)
+        if not records or (isinstance(records, list) and len(records) == 0):
+            return json.dumps(
+                {"action": "diet_plan_history", "history": [], "message": "您还没有饮食计划历史记录。"},
+                ensure_ascii=False
+            )
+        history_list = []
+        for r in records:
+            plan_data = r.get("planData", "{}")
+            if isinstance(plan_data, str):
+                try:
+                    plan_data = json.loads(plan_data)
+                except json.JSONDecodeError:
+                    pass
+            history_list.append({
+                "id": r.get("id"),
+                "plan": plan_data,
+                "week_start_date": r.get("weekStartDate"),
+                "status": r.get("status"),
+                "created_at": r.get("createdAt"),
+            })
+        output = {
+            "action": "diet_plan_history",
+            "history": history_list,
+            "message": f"您共有{len(history_list)}条饮食计划历史",
+        }
+        return json.dumps(output, ensure_ascii=False)
+    except PermissionError as e:
+        return json.dumps({"action": "error", "message": str(e)}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"action": "error", "message": f"查询饮食计划历史失败：{str(e)}"}, ensure_ascii=False)
+
+
+# ==================== 饮食计划数据源 ====================
+
 def fetch_dishes_for_planning(session_id: str) -> str:
     """从 Java 后端获取全部可用菜品（结构化数据），供 AI 饮食计划生成使用。
 
@@ -344,8 +324,8 @@ def fetch_dishes_for_planning(session_id: str) -> str:
 
     # 方案1: 从 Java 后端获取（实时数据）
     try:
-        result = _health_get("/api/user/dishes", session_id, params={})
-        raw = _extract_data(result)
+        result = bc.get("/api/user/dishes", session_id)
+        raw = bc.extract_data(result)
         records = []
         if isinstance(raw, list):
             records = raw
@@ -373,9 +353,8 @@ def fetch_dishes_for_planning(session_id: str) -> str:
     # 方案2: 回退到本地知识库 JSON（含完整营养数据）
     if not dishes:
         try:
-            import os as _os
-            kb_path = _os.path.join(_os.path.dirname(__file__), "data", "dish_knowledge.json")
-            if _os.path.exists(kb_path):
+            kb_path = os.path.join(os.path.dirname(__file__), "data", "dish_knowledge.json")
+            if os.path.exists(kb_path):
                 with open(kb_path, "r", encoding="utf-8") as f:
                     kb_dishes = json.load(f)
                 for d in kb_dishes:
@@ -421,9 +400,8 @@ def fetch_dietary_rules_for_goal(health_goal: str) -> str:
         JSON 字符串，包含匹配到的饮食规则
     """
     try:
-        import os as _os
-        kb_path = _os.path.join(_os.path.dirname(__file__), "data", "dietary_knowledge.json")
-        if not _os.path.exists(kb_path):
+        kb_path = os.path.join(os.path.dirname(__file__), "data", "dietary_knowledge.json")
+        if not os.path.exists(kb_path):
             return json.dumps({"action": "no_rules", "rules": []}, ensure_ascii=False)
 
         with open(kb_path, "r", encoding="utf-8") as f:
@@ -465,47 +443,3 @@ def fetch_dietary_rules_for_goal(health_goal: str) -> str:
 
     except Exception as e:
         return json.dumps({"action": "error", "message": f"获取饮食规则失败：{str(e)}"}, ensure_ascii=False)
-
-
-def get_diet_plan_history(session_id: str, limit: int = 10) -> str:
-    """查询饮食计划历史列表。
-
-    参数:
-        limit: 返回条数，默认 10
-
-    返回:
-        饮食计划历史列表 JSON
-    """
-    try:
-        result = _health_get("/api/user/health/diet-plan/history", session_id, params={"limit": limit})
-        records = _extract_data(result)
-        if not records or (isinstance(records, list) and len(records) == 0):
-            return json.dumps(
-                {"action": "diet_plan_history", "history": [], "message": "您还没有饮食计划历史记录。"},
-                ensure_ascii=False
-            )
-        history_list = []
-        for r in records:
-            plan_data = r.get("planData", "{}")
-            if isinstance(plan_data, str):
-                try:
-                    plan_data = json.loads(plan_data)
-                except json.JSONDecodeError:
-                    pass
-            history_list.append({
-                "id": r.get("id"),
-                "plan": plan_data,
-                "week_start_date": r.get("weekStartDate"),
-                "status": r.get("status"),
-                "created_at": r.get("createdAt"),
-            })
-        output = {
-            "action": "diet_plan_history",
-            "history": history_list,
-            "message": f"您共有{len(history_list)}条饮食计划历史",
-        }
-        return json.dumps(output, ensure_ascii=False)
-    except PermissionError as e:
-        return json.dumps({"action": "error", "message": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"action": "error", "message": f"查询饮食计划历史失败：{str(e)}"}, ensure_ascii=False)

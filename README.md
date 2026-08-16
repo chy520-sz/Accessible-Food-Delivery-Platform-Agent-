@@ -1,5 +1,66 @@
 # 无障碍外卖 Agent 完全体
 
+## 2026-08-03 Agent 端优化
+
+本轮针对 Agent 端做了一轮架构与可靠性优化，要点如下：
+
+### 真实链路打通
+- 新增 `query_order_status` 工具：查询订单真实配送状态（商家接单/骑手分配/预计送达/关键时间点），
+  对接 Java 后端 `GET /api/agent/orders/{id}/status`。
+- 商家接单/配送/完成三个桥接工具（`merchant_accept_order`、`delivery_pickup_order`、
+  `delivery_complete_order`）现在同时携带**用户 JWT + X-Agent-Key** 调用 Java 后端，
+  不再因缺少用户令牌而 401。
+- `delivery_pickup_order` 按 Java 后端真实返回字段解析，不再播报"配送员 N/A"。
+- `simulate_multi_agent` 明确为**仅演示**用途（虚构数据），提示词与工具描述双重约束，
+  真实订单进度一律走 `query_order_status`。
+- 饮食计划生成后自动调用 `save_diet_plan` 落库（后端未实现时返回保存提示，不影响计划内容）。
+- 注意：`AGENT_API_KEY` 必须与 Java 后端 `agent.api-key` 一致（默认 `agent-demo-key-2026`），
+  已写入 `.env` 与 `.env.example`。
+
+### 下单防重
+- 所有 POST/PUT/DELETE 变更操作**不再自动重试**（防止响应丢失时重复下单/重复加购/重复评分）；
+  仅 GET 查询保留超时/5xx 安全重试。
+
+### 资源治理
+- 会话按 `SESSION_EXPIRE_SECONDS` 定期清理（后台任务，间隔 `SESSION_CLEANUP_INTERVAL`），
+  释放内存与 AgentExecutor；过期 JWT 一并清除。
+- LLM 与 httpx 客户端改为进程内单例（`llm_client.py`），服务关闭时统一释放；
+  饮食计划生成复用同一套客户端。
+- TTS 改为异步子进程（`asyncio.create_subprocess_exec`），不再阻塞事件循环。
+- 健康检查不再每次真调大模型：LLM 健康状态缓存 `LLM_HEALTH_TTL` 秒，
+  Java 后端探活带 30 秒缓存。
+
+### 安全收敛
+- 配置 `AGENT_SERVICE_API_KEY` 后，所有 `/agent/*` 接口要求 `X-Agent-Key` 请求头
+  （留空为开发模式，启动时打印警告）。
+- 按来源 IP 对 `/agent/*` 限流（`AGENT_RATE_LIMIT_PER_MINUTE`，健康检查除外）。
+- 语音上传限制大小（默认 10MB，`AGENT_MAX_AUDIO_BYTES`）与格式（wav/pcm）。
+- CORS 白名单收敛为 `AGENT_CORS_ORIGINS`（不再使用 `*`）。
+- 登录态同步改为**后端真实校验 JWT**（`backend_client.validate_user_token`），
+  不再信任客户端直接传来的 payload；过期时间以 token `exp` 与配置取较小值。
+
+### 工程化
+- 新增 `backend_client.py` 统一 HTTP 客户端，`tools.py` 与 `health_tools.py` 共用，
+  删除重复封装（此前两套重试策略不一致）。
+- 新增 `text_utils.py`（TTS 文本清理独立模块）、`llm_client.py`（LLM 单例）。
+- 清理死代码：未使用的导入/函数（`get_dish_nutrition`、`is_knowledge_base_ready`、
+  `format_plan_for_tts` 改为实际使用等）。
+- 新增单元测试（`tests/`）、`pyproject.toml`（ruff + pytest 配置）、`requirements-dev.txt`。
+- 新增 `sync_dish_knowledge.py`：知识库 JSON 去重校验 + 与后端实时菜品对齐（可选登录）。
+
+### 运行与验证
+
+```powershell
+# 语法检查
+python -m py_compile main.py agent.py tools.py health_tools.py health_validator.py diet_planner.py knowledge_base.py build_knowledge_base.py speech.py config.py
+
+# 单元测试（需 pip install -r requirements-dev.txt）
+python -m pytest
+
+# 代码检查
+python -m ruff check .
+```
+
 ## 2026-06-08 骑手端补充
 
 项目组成新增：

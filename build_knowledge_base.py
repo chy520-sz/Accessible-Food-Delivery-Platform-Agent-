@@ -229,7 +229,7 @@ def main():
                     embedding_function=embeddings,
                 )
                 old_store.delete_collection()
-                print(f"    已删除旧集合")
+                print("    已删除旧集合")
             except Exception:
                 pass
 
@@ -239,16 +239,16 @@ def main():
             persist_directory=RAG_PERSIST_DIR,
             collection_name=collection_name,
         )
-        print(f"    [OK] 已持久化到 Chroma")
+        print("    [OK] 已持久化到 Chroma")
         total_chunks += len(chunks)
 
     # 4. 完成
-    print(f"\n[4/4] [OK] 知识库构建完成！")
+    print("\n[4/4] [OK] 知识库构建完成！")
     print(f"    持久化目录: {os.path.abspath(RAG_PERSIST_DIR)}")
     print(f"    集合数量: {len(collections)}")
     print(f"    总向量数: {total_chunks}")
-    print(f"\n现在可以启动 Agent 服务，LLM 将能通过工具使用这些知识。")
-    print(f"  python main.py")
+    print("\n现在可以启动 Agent 服务，LLM 将能通过工具使用这些知识。")
+    print("  python main.py")
 
 
 if __name__ == "__main__":

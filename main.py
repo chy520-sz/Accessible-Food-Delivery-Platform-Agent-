@@ -6,49 +6,123 @@ FastAPI 主入口 —— 小鹿 AI 语音Agent服务（端口 8000）。
   POST /agent/voice    — 语音对话（音频 in / MP3 out）
   GET  /agent/health   — 服务健康检查
 
+安全与运维:
+  - 配置 AGENT_SERVICE_API_KEY 后，所有 /agent/* 接口要求 X-Agent-Key 请求头
+  - 按来源 IP 限流（/agent/health 除外）
+  - CORS 白名单由 AGENT_CORS_ORIGINS 控制（默认仅本地开发端口）
+  - 服务启动后后台定时清理过期会话，关闭时释放 LLM/HTTP 资源
+
 启动方式:
   python main.py
   或:
-  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+  uvicorn main:app --host 0.0.0.0 --port 8000
 """
+import asyncio
 import logging
+import time
 import traceback as tb
 import uuid
+from collections import deque
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, File, Request, UploadFile, Form
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-from agent import chat, get_agent_status, get_or_create_session, _sessions, sync_login_token
-from config import AGENT_HOST, AGENT_PORT
+from agent import (
+    chat,
+    cleanup_sessions,
+    get_agent_status,
+    get_or_create_session,
+    shutdown as agent_shutdown,
+    sync_login_token,
+    _sessions,
+)
+from config import (
+    AGENT_CORS_ORIGINS,
+    AGENT_HOST,
+    AGENT_MAX_AUDIO_BYTES,
+    AGENT_PORT,
+    AGENT_RATE_LIMIT_PER_MINUTE,
+    AGENT_RELOAD,
+    AGENT_SERVICE_API_KEY,
+    SESSION_CLEANUP_INTERVAL,
+)
 from speech import recognize_speech, synthesize_speech
 
 # 修复[错误分级]：配置日志，记录完整错误上下文
 logger = logging.getLogger("main")
 
+
+# ==================== 限流器 ====================
+
+class _RateLimiter:
+    """按 key（来源 IP）的滑动窗口限流器。"""
+
+    def __init__(self, limit: int, window: float = 60.0):
+        self.limit = limit
+        self.window = window
+        self._hits: dict[str, deque] = {}
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        q = self._hits.setdefault(key, deque())
+        while q and now - q[0] > self.window:
+            q.popleft()
+        if len(q) >= self.limit:
+            return False
+        q.append(now)
+        return True
+
+
+_rate_limiter = _RateLimiter(AGENT_RATE_LIMIT_PER_MINUTE)
+
+
 # ==================== FastAPI 应用初始化 ====================
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动后台会话清理任务，关闭时释放全局资源。"""
+    cleanup_task = asyncio.create_task(_session_cleanup_loop())
+    logger.info("[main] Agent 服务启动，限流=%d/min，鉴权=%s",
+                AGENT_RATE_LIMIT_PER_MINUTE, "开启" if AGENT_SERVICE_API_KEY else "关闭(开发模式)")
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        agent_shutdown()
+        logger.info("[main] Agent 服务关闭，资源已释放")
+
 
 app = FastAPI(
     title="小鹿 AI 语音Agent服务",
     description="面向视障人群的智能语音外卖平台 —— Agent服务",
-    version="1.0.0",
+    version="1.1.0",
+    lifespan=lifespan,
 )
 
-# CORS 配置：允许 Java 前端（3000）跨域访问
+# CORS 配置：白名单来自环境变量，不使用 "*"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:8080",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-        "*",  # 比赛演示环境宽松配置
-    ],
+    allow_origins=AGENT_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,16 +130,48 @@ app.add_middleware(
 )
 
 
+async def _session_cleanup_loop() -> None:
+    """周期清理过期会话，避免进程内存无限增长。"""
+    while True:
+        await asyncio.sleep(SESSION_CLEANUP_INTERVAL)
+        try:
+            cleanup_sessions()
+        except Exception:
+            logger.exception("[main] 会话清理任务异常")
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """对 /agent/* 请求按来源 IP 限流（健康检查除外）。"""
+    path = request.url.path
+    if path.startswith("/agent") and not path.startswith("/agent/health"):
+        key = request.client.host if request.client else "unknown"
+        if not _rate_limiter.allow(key):
+            trace_id = uuid.uuid4().hex[:12]
+            logger.warning("[rate_limit] 429 ip=%s path=%s trace=%s", key, path, trace_id)
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "code": 429,
+                    "error_code": "CLT-1-429",
+                    "message": "请求过于频繁，请稍后再试",
+                    "trace_id": trace_id,
+                },
+            )
+    return await call_next(request)
+
+
+def require_service_key(x_agent_key: str = Header(default="")) -> None:
+    """服务密钥鉴权：配置了 AGENT_SERVICE_API_KEY 时强制校验 X-Agent-Key。"""
+    if AGENT_SERVICE_API_KEY and x_agent_key != AGENT_SERVICE_API_KEY:
+        raise HTTPException(status_code=401, detail="无效的服务密钥")
+
+
 # ==================== 全局异常处理 ====================
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """兜底异常处理器。
-
-    修复[根因]：此前未捕获异常直接由 FastAPI 默认 handler 处理，返回无 trace_id 的
-    通用 500 错误（如 agent.py 中 get_or_create_session 在 try 外抛异常时）。
-    现在生成 UUID trace_id，记录含完整堆栈的结构化日志，返回脱敏后含追踪 ID 的响应。
-    """
+    """兜底异常处理器：返回带 trace_id 的脱敏 500。"""
     trace_id = uuid.uuid4().hex[:12]
     logger.error(
         "[global_error] trace=%s path=%s method=%s exc_type=%s msg=%s\n%s",
@@ -89,14 +195,9 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """HTTP 异常处理 —— 区分 4xx 客户端错误和 5xx 服务端错误。
-
-    修复[错误分级]：4xx 错误直接透传具体原因（参数缺失、格式错误等）；
-    5xx 错误附加 trace_id 供排查，不再笼统返回"系统出了错误"。
-    """
+    """HTTP 异常处理 —— 区分 4xx 客户端错误和 5xx 服务端错误。"""
     trace_id = uuid.uuid4().hex[:12]
     if exc.status_code < 500:
-        # 4xx 客户端错误：精确返回校验失败原因
         return JSONResponse(
             status_code=exc.status_code,
             content={
@@ -106,7 +207,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
                 "trace_id": trace_id,
             },
         )
-    # 5xx 服务端错误：脱敏后附加 trace_id
     logger.error(
         "[http_error] trace=%s status=%d detail=%s",
         trace_id, exc.status_code, exc.detail,
@@ -144,7 +244,7 @@ class TextResponse(BaseModel):
     reply: str
     tts_text: str = ""
     is_new_session: bool = False
-    # 修复[错误分级]：每次请求生成唯一 trace_id，便于前后端联合排障
+    # 每次请求生成唯一 trace_id，便于前后端联合排障
     trace_id: str = ""
 
 
@@ -159,7 +259,7 @@ class HealthResponse(BaseModel):
 
 # ==================== 接口实现 ====================
 
-@app.post("/agent/sync", response_model=TextResponse)
+@app.post("/agent/sync", response_model=TextResponse, dependencies=[Depends(require_service_key)])
 async def agent_sync(req: SyncRequest):
     """登录态同步接口。
 
@@ -189,7 +289,7 @@ async def agent_sync(req: SyncRequest):
     )
 
 
-@app.post("/agent/text", response_model=TextResponse)
+@app.post("/agent/text", response_model=TextResponse, dependencies=[Depends(require_service_key)])
 async def agent_text(req: TextRequest):
     """文本对话接口。
 
@@ -206,13 +306,12 @@ async def agent_text(req: TextRequest):
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="消息内容不能为空")
 
-    # 修复[错误分级]：对话请求附加系统毫秒级日志时间戳，便于性能分析
-    import time as _time
-    _start = _time.time()
+    # 对话请求附加系统毫秒级日志时间戳，便于性能分析
+    _start = time.time()
 
     result = await chat(req.session_id, req.text.strip(), req.auth_token)
 
-    _elapsed = (_time.time() - _start) * 1000
+    _elapsed = (time.time() - _start) * 1000
     logger.info(
         "[agent_text] session=%s elapsed=%.0fms reply_len=%d",
         result["session_id"], _elapsed, len(result["reply"]),
@@ -228,7 +327,7 @@ async def agent_text(req: TextRequest):
     )
 
 
-@app.post("/agent/voice")
+@app.post("/agent/voice", dependencies=[Depends(require_service_key)])
 async def agent_voice(
     audio_file: UploadFile = File(...),
     audio_format: str = Form(default="wav"),
@@ -240,7 +339,7 @@ async def agent_voice(
     返回 MP3 音频和识别/回复文本。
 
     请求格式: multipart/form-data
-      - audio_file: 音频文件（16kHz, 16bit, 单声道 WAV/PCM）
+      - audio_file: 音频文件（16kHz, 16bit, 单声道 WAV/PCM，最大 10MB）
       - audio_format: 音频格式，"wav" 或 "pcm"（默认 wav）
       - session_id: 会话ID（可选，用于多轮对话）
 
@@ -248,15 +347,25 @@ async def agent_voice(
       - Headers: x-session-id, x-recognized-text, x-reply-text
       - Body: MP3 音频二进制数据
     """
-    # 1. 读取上传的音频数据
+    # 1. 读取上传的音频数据（限制大小与格式）
     audio_bytes = await audio_file.read()
-    print(f"[Voice] 收到音频: {len(audio_bytes)} 字节, 格式: {audio_format}")
     if not audio_bytes or len(audio_bytes) < 1600:
         raise HTTPException(status_code=400, detail="音频数据过短，请重新录音")
+    if len(audio_bytes) > AGENT_MAX_AUDIO_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"音频文件过大（最大 {AGENT_MAX_AUDIO_BYTES // 1024 // 1024}MB）",
+        )
+    if audio_format not in ("wav", "pcm"):
+        raise HTTPException(status_code=400, detail="audio_format 仅支持 wav 或 pcm")
+    logger.info(
+        "[voice] 收到音频: %d 字节, 格式: %s, content_type: %s",
+        len(audio_bytes), audio_format, audio_file.content_type,
+    )
 
     # 2. ASR 语音识别
     recognized = await recognize_speech(audio_bytes, audio_format)
-    print(f"[Voice] ASR 识别结果: '{recognized}'")
+    logger.info("[voice] ASR 识别结果: '%s'", recognized)
     if not recognized:
         raise HTTPException(status_code=422, detail="语音识别失败，请重试或使用文字输入")
 
@@ -265,24 +374,14 @@ async def agent_voice(
     reply = result["reply"]
     tts_text = result.get("tts_text", reply)
     new_session_id = result["session_id"]
-    print(f"[Voice] LLM 回复: '{reply[:100]}{'...' if len(reply) > 100 else ''}'")
+    logger.info("[voice] LLM 回复: '%s'", reply[:100])
 
     # 4. TTS 语音合成 —— 使用清理后的 tts_text
     mp3_bytes = await synthesize_speech(tts_text)
-    print(f"[Voice] TTS 合成: {len(mp3_bytes)} 字节")
+    logger.info("[voice] TTS 合成: %d 字节", len(mp3_bytes))
 
     if not mp3_bytes:
-        print("[Voice] TTS 返回空音频，降级返回文本")
-        return Response(
-            content=b"",
-            media_type="audio/mpeg",
-            headers={
-                "x-session-id": new_session_id,
-                "x-recognized-text": quote(recognized, safe=""),
-                "x-reply-text": quote(reply, safe=""),
-                "x-tts-text": quote(tts_text, safe=""),
-            },
-        )
+        logger.warning("[voice] TTS 返回空音频，降级返回文本")
 
     return Response(
         content=mp3_bytes,
@@ -310,13 +409,9 @@ async def agent_health():
     return HealthResponse(**status)
 
 
-@app.delete("/agent/session/{session_id}")
+@app.delete("/agent/session/{session_id}", dependencies=[Depends(require_service_key)])
 async def agent_session_delete(session_id: str):
-    """清除指定会话（主要用于调试）。
-
-    参数:
-        session_id: 要清除的会话ID
-    """
+    """清除指定会话（主要用于调试）。"""
     if session_id in _sessions:
         del _sessions[session_id]
         return JSONResponse({"code": 200, "message": f"会话 {session_id} 已清除"})
@@ -332,14 +427,13 @@ if __name__ == "__main__":
     print("   面向视障人群的智能外卖平台")
     print("=" * 50)
     print(f"   监听地址: http://{AGENT_HOST}:{AGENT_PORT}")
-    print(f"   LLM模型: deepseek-chat (DeepSeek)")
-    print(f"   Java后端: http://localhost:3000")
     print(f"   API文档: http://localhost:{AGENT_PORT}/docs")
+    print(f"   reload: {AGENT_RELOAD}")
     print("=" * 50)
     uvicorn.run(
         "main:app",
         host=AGENT_HOST,
         port=AGENT_PORT,
-        reload=True,
+        reload=AGENT_RELOAD,
         log_level="info",
     )
