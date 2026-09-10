@@ -1,305 +1,372 @@
 """
-知识库检索模块 —— 基于 Chroma 向量数据库 + BGE 中文嵌入模型。
+知识库检索模块 —— 基于 Milvus + 百炼 Qwen 文本嵌入（COSINE 稠密检索）。
 
-功能:
-  - 使用 BAAI/bge-small-zh-v1.5 本地嵌入模型（无需 API Key，~100MB）
-  - Chroma 向量存储，持久化到磁盘
-  - 语义相似度检索，支持多个知识集合
-  - 带 tenacity 自动重试的鲁棒检索
+职责:
+  - 进程内共享官方 MilvusClient（懒加载）
+  - 查询进程只连接“已构建”的集合，绝不在每次启动/查询时自动建库
+  - COSINE 度量：相似度越大越相关（旧 Chroma 的“分数越小越相关”阈值已废弃）
+  - 按“逻辑知识类型”(dish/dietary/faq) 决定格式化，不再硬编码物理集合名
+  - top_k 起步、最低相关阈值过滤；没有可靠命中时允许返回“未找到”，不硬拼答案
+  - 基础设施错误（Milvus 停机/维度不匹配）抛类型化异常，不伪装成“没有知识”
 
-模型下载策略:
-  1. 优先使用 ModelScope 国内镜像下载（速度快，网络兼容性好）
-  2. 回退到 HuggingFace 官方源
-  3. 支持通过环境变量指定本地已下载的模型路径
-
-使用方式:
+使用:
   from knowledge_base import search_knowledge
-  result = search_knowledge("川菜有什么特点？", "dish_knowledge", top_k=5)
+  search_knowledge("川菜有什么特点？", RAG_COLLECTION_FOOD, logical_type="dish")
 """
-import os
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+import uuid
 from typing import Optional
 
-from langchain_chroma import Chroma
-from langchain_core.embeddings import Embeddings
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-
-from config import (
-    RAG_PERSIST_DIR,
-    RAG_EMBEDDING_MODEL,
-    RAG_TOP_K,
-    MAX_RETRIES,
-    RETRY_DELAY,
+from langchain_core.documents import Document
+from pymilvus import MilvusClient
+from pymilvus.exceptions import MilvusException
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
 )
 
-# ==================== 嵌入模型管理 ====================
+from config import (
+    MAX_RETRIES,
+    MILVUS_DB_NAME,
+    MILVUS_TOKEN,
+    MILVUS_URI,
+    RAG_KNOWLEDGE_COLLECTIONS,
+    RAG_METRIC_TYPE,
+    RAG_MIN_SCORE,
+    RAG_TOP_K,
+)
+from embedding_client import get_embeddings
 
-_embedding_model = None  # 懒加载单例
-
-
-class _STEmbeddings(Embeddings):
-    """sentence-transformers 适配 LangChain Embeddings 接口。
-
-    将 BGE 中文嵌入模型包装为 LangChain 兼容的 Embeddings 类，
-    实现 embed_documents 和 embed_query 两个必需方法。
-    """
-
-    def __init__(self, model):
-        self._model = model
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """批量向量化文档（构建知识库时使用）"""
-        return self._model.encode(
-            texts, normalize_embeddings=True, show_progress_bar=True
-        ).tolist()
-
-    def embed_query(self, text: str) -> list[float]:
-        """向量化查询文本（检索时使用）"""
-        return self._model.encode(
-            text, normalize_embeddings=True
-        ).tolist()
+logger = logging.getLogger("knowledge_base")
 
 
-def _download_model_from_modelscope(model_name: str) -> str:
-    """通过 ModelScope（阿里云国内镜像）下载模型，返回本地路径。
+# ==================== 异常类型 ====================
 
-    ModelScope 无需特殊网络配置，适合国内开发环境。
-    首次下载约 100MB，后续使用缓存。
-    """
-    from modelscope import snapshot_download
-
-    # ModelScope 上的模型路径映射
-    modelscope_id = model_name  # BAAI/bge-small-zh-v1.5 在 ModelScope 上路径相同
-    print(f"[RAG] 正在从 ModelScope 下载模型: {modelscope_id} ...")
-    local_path = snapshot_download(modelscope_id)
-    print(f"[RAG] ModelScope 下载完成: {local_path}")
-    return local_path
+class KnowledgeStoreError(RuntimeError):
+    """知识库基础设施错误（连接失败、维度不匹配等），不应被当成“没找到知识”。"""
 
 
-def _download_model_from_huggingface(model_name: str) -> str:
-    """通过 HuggingFace 下载模型，返回本地路径。
-
-    如果环境有 HuggingFace 镜像（如 hf-mirror.com），
-    可通过环境变量 HF_ENDPOINT 指定。
-    """
-    from huggingface_hub import snapshot_download
-
-    endpoint = os.environ.get("HF_ENDPOINT", "")
-    if endpoint:
-        print(f"[RAG] 使用 HuggingFace 镜像: {endpoint}")
-    print(f"[RAG] 正在从 HuggingFace 下载模型: {model_name} ...")
-    local_path = snapshot_download(model_name)
-    print(f"[RAG] HuggingFace 下载完成: {local_path}")
-    return local_path
+class KnowledgeNotBuilt(KnowledgeStoreError):
+    """目标集合尚不存在或为空（尚未构建向量库）。"""
 
 
-def _get_embedding_model():
-    """懒加载 BGE 中文嵌入模型。
+# ==================== 逻辑知识类型元数据 ====================
+# 物理集合名 -> 逻辑类型
+_COLLECTION_TO_LOGICAL = {phys: logical for logical, phys in RAG_KNOWLEDGE_COLLECTIONS.items()}
 
-    下载策略：
-      1. 如果环境变量 RAG_MODEL_PATH 已设置，直接使用本地模型
-      2. 优先尝试 ModelScope（国内镜像，速度快）
-      3. 回退到 HuggingFace 官方源
+_LOGICAL_META = {
+    "dish": {
+        "label": "菜品知识",
+        "empty_name": "菜品知识库",
+        "hint_keys": ("name", "category"),
+    },
+    "dietary": {
+        "label": "饮食知识",
+        "empty_name": "饮食健康知识库",
+        "hint_keys": ("condition",),
+    },
+    "faq": {
+        "label": "常见问题",
+        "empty_name": "常见问题知识库",
+        "hint_keys": ("category",),
+    },
+}
 
-    模型首次下载约 100MB，后续调用复用缓存。
-    """
-    global _embedding_model
-    if _embedding_model is not None:
-        return _embedding_model
 
-    from sentence_transformers import SentenceTransformer
+def logical_type_of(collection: str, metadata: Optional[dict] = None) -> str:
+    """根据物理集合名（优先用元数据里的 knowledge_type）推断逻辑知识类型。"""
+    if metadata and metadata.get("knowledge_type") in _LOGICAL_META:
+        return metadata["knowledge_type"]
+    return _COLLECTION_TO_LOGICAL.get(collection, "unknown")
 
-    # 0. 检查是否指定了本地模型路径
-    local_path = os.environ.get("RAG_MODEL_PATH", "")
-    if local_path and os.path.exists(local_path):
-        print(f"[RAG] 使用本地模型: {local_path}")
-        model = SentenceTransformer(local_path)
-        _embedding_model = _STEmbeddings(model)
-        print("[RAG] 嵌入模型加载完成。")
-        return _embedding_model
 
-    # 1. 尝试 ModelScope
-    model_path = None
+# ==================== Milvus 连接管理 ====================
+
+_client_lock = threading.Lock()
+_milvus_client: Optional[MilvusClient] = None
+_store_cache: set[str] = set()
+
+
+def connection_args() -> dict:
+    """pymilvus 连接参数。"""
+    args = {"uri": MILVUS_URI, "db_name": MILVUS_DB_NAME}
+    if MILVUS_TOKEN:
+        args["token"] = MILVUS_TOKEN
+    return args
+
+
+def get_milvus_client() -> MilvusClient:
+    """获取进程内共享的 MilvusClient（连接失败抛 KnowledgeStoreError）。"""
+    global _milvus_client
+    if _milvus_client is not None:
+        return _milvus_client
+    with _client_lock:
+        if _milvus_client is None:
+            try:
+                _milvus_client = MilvusClient(**connection_args())
+            except Exception as e:  # 连接参数错误/服务不可达
+                raise KnowledgeStoreError(f"无法连接 Milvus（{MILVUS_URI}）：{type(e).__name__}: {e}") from e
+    return _milvus_client
+
+
+def ping_milvus() -> bool:
+    """轻量探活：是否能列出集合。"""
     try:
-        model_path = _download_model_from_modelscope(RAG_EMBEDDING_MODEL)
-    except ImportError:
-        print("[RAG] ModelScope 未安装。如需使用国内镜像加速下载，请运行:")
-        print("       pip install modelscope")
+        get_milvus_client().list_collections()
+        return True
+    except KnowledgeStoreError:
+        return False
+    except MilvusException:
+        return False
+
+
+def collection_exists(collection_name: str) -> bool:
+    """集合是否存在（查询路径用它判断，避免 langchain 自动建集合）。"""
+    try:
+        return bool(get_milvus_client().has_collection(collection_name))
+    except KnowledgeStoreError:
+        raise
     except Exception as e:
-        print(f"[RAG] ModelScope 下载失败: {e}")
+        raise KnowledgeStoreError(f"检查集合 {collection_name} 是否存在失败：{e}") from e
 
-    # 2. 回退到 HuggingFace
-    if model_path is None:
-        try:
-            model_path = _download_model_from_huggingface(RAG_EMBEDDING_MODEL)
-        except ImportError:
-            raise RuntimeError(
-                "未安装 huggingface_hub 库。请运行:\n"
-                "  pip install huggingface_hub\n"
-                "或者使用国内镜像:\n"
-                "  pip install modelscope"
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"模型下载失败（ModelScope 和 HuggingFace 均失败）。\n"
-                f"HuggingFace 错误: {e}\n"
-                f"\n"
-                f"请尝试以下方法之一：\n"
-                f"  1. 使用 ModelScope: pip install modelscope 后重试\n"
-                f"  2. 设置 HuggingFace 镜像: 设置环境变量 HF_ENDPOINT=https://hf-mirror.com\n"
-                f"  3. 手动下载模型并设置: RAG_MODEL_PATH=/path/to/model\n"
-                f"     下载地址: https://modelscope.cn/models/BAAI/bge-small-zh-v1.5"
-            )
 
-    # 3. 加载模型
-    print(f"[RAG] 正在加载嵌入模型: {RAG_EMBEDDING_MODEL} ...")
+def collection_count(collection_name: str) -> int:
+    """返回集合实体数（集合不存在返回 0）。"""
     try:
-        model = SentenceTransformer(model_path)
-        _embedding_model = _STEmbeddings(model)
-        print("[RAG] 嵌入模型加载完成。")
-        return _embedding_model
-    except ImportError:
-        raise RuntimeError(
-            "未安装 sentence-transformers 库。请运行:\n"
-            "  pip install sentence-transformers"
-        )
+        client = get_milvus_client()
+        if not client.has_collection(collection_name):
+            return 0
+        stats = client.get_collection_stats(collection_name)
+        return int(stats.get("row_count", 0))
     except Exception as e:
-        raise RuntimeError(
-            f"加载嵌入模型失败: {e}\n"
-            f"模型路径: {model_path}"
-        )
+        raise KnowledgeStoreError(f"读取集合 {collection_name} 计数失败：{e}") from e
 
 
-# ==================== 向量存储管理 ====================
+def reset_store_cache() -> None:
+    """构建/删除集合后清空向量存储缓存。"""
+    _store_cache.clear()
 
-_vector_stores: dict[str, Chroma] = {}  # 按集合名称缓存
 
-
-def _get_vector_store(collection_name: str) -> Optional[Chroma]:
-    """获取指定集合的 Chroma 向量存储实例。
-
-    如果 Chroma DB 目录不存在或集合为空，返回 None。
-    此函数不会自动创建集合——集合由 build_knowledge_base.py 构建。
-    """
-    if collection_name in _vector_stores:
-        return _vector_stores[collection_name]
-
-    # 检查持久化目录是否存在
-    if not os.path.exists(RAG_PERSIST_DIR):
-        return None
-
-    try:
-        embeddings = _get_embedding_model()
-        store = Chroma(
-            persist_directory=RAG_PERSIST_DIR,
-            collection_name=collection_name,
-            embedding_function=embeddings,
-        )
-        # 检查集合是否有数据
+def close_milvus_client() -> None:
+    """关闭共享 MilvusClient，并允许后续按需重新连接。"""
+    global _milvus_client
+    with _client_lock:
+        client = _milvus_client
+        _milvus_client = None
+        _store_cache.clear()
+    if client is not None:
         try:
-            count = store._collection.count()
-            if count == 0:
-                return None
+            client.close()
         except Exception:
-            pass
-        _vector_stores[collection_name] = store
+            logger.debug("关闭 MilvusClient 失败", exc_info=True)
+
+
+def _get_vector_store(collection_name: str) -> Optional[MilvusClient]:
+    """获取已构建集合使用的 MilvusClient；不存在或为空返回 None。
+
+    严格不自动建集合：先 has_collection 判断，再构造只读用途的 Milvus 对象。
+    """
+    if collection_name in _store_cache:
+        return get_milvus_client()
+    if not collection_exists(collection_name):
+        return None
+    try:
+        store = get_milvus_client()
+        if collection_count(collection_name) == 0:
+            return None
+        store.load_collection(collection_name)
+        _store_cache.add(collection_name)
         return store
     except Exception as e:
-        print(f"[RAG] 加载向量存储失败 ({collection_name}): {e}")
-        return None
+        raise KnowledgeStoreError(f"加载集合 {collection_name} 失败：{type(e).__name__}: {e}") from e
 
 
-# ==================== 核心检索函数 ====================
+# ==================== 结果格式化 ====================
+
+def _relevance_stars(score: float) -> str:
+    """COSINE 相似度（越大越相关）转易读标记。阈值可随评测校准。"""
+    if score >= 0.6:
+        return "★★★ 高度相关"
+    if score >= 0.4:
+        return "★★☆ 相关"
+    return "★☆☆ 低相关"
+
+
+def _format_meta_hint(logical_type: str, metadata: dict) -> str:
+    """按逻辑知识类型格式化标题提示，而不是比较物理集合名。"""
+    if logical_type == "dish":
+        name = metadata.get("name", "")
+        category = metadata.get("category", "")
+        hint = f"【{name}】" if name else ""
+        if category:
+            hint += f"[{category}] "
+        return hint
+    if logical_type == "dietary":
+        condition = metadata.get("condition", "")
+        return f"【{condition}】" if condition else ""
+    if logical_type == "faq":
+        category = metadata.get("category", "")
+        return f"【{category}】" if category else ""
+    return ""
+
+
+# ==================== 核心检索 ====================
 
 @retry(
     stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_fixed(RETRY_DELAY),
-    retry=retry_if_exception_type((OSError, ConnectionError, RuntimeError)),
+    wait=wait_exponential(multiplier=1, min=1, max=6),
+    retry=retry_if_exception_type((MilvusException, ConnectionError, OSError)),
     reraise=True,
 )
+def _similarity_search(
+    store: MilvusClient,
+    collection: str,
+    query: str,
+    top_k: int,
+    rag_id: str = "-",
+):
+    embedding_started = time.perf_counter()
+    query_vector = get_embeddings().embed_query(query)
+    logger.info(
+        "[RAG][%s] EMBEDDING_DONE dim=%d elapsed_ms=%.0f",
+        rag_id,
+        len(query_vector),
+        (time.perf_counter() - embedding_started) * 1000,
+    )
+
+    search_started = time.perf_counter()
+    rows = store.search(
+        collection_name=collection,
+        data=[query_vector],
+        anns_field="vector",
+        limit=top_k,
+        output_fields=["*"],
+        search_params={"metric_type": RAG_METRIC_TYPE, "params": {}},
+    )
+    hits = rows[0] if rows else []
+    logger.info(
+        "[RAG][%s] MILVUS_DONE collection=%s candidates=%d elapsed_ms=%.0f",
+        rag_id,
+        collection,
+        len(hits),
+        (time.perf_counter() - search_started) * 1000,
+    )
+    out = []
+    for hit in hits:
+        entity = dict(hit.get("entity") or {})
+        text = str(entity.pop("text", ""))
+        entity.setdefault("pk", hit.get("id"))
+        score = hit.get("distance", hit.get("score", 0.0))
+        out.append((Document(page_content=text, metadata=entity), float(score)))
+    return out
+
+
 def search_knowledge(
     query: str,
-    collection: str = "dish_knowledge",
+    collection: str,
     top_k: int = RAG_TOP_K,
+    logical_type: Optional[str] = None,
+    min_score: float = RAG_MIN_SCORE,
+    trace_id: Optional[str] = None,
 ) -> str:
-    """语义检索知识库，返回格式化文本结果。
-
-    使用 BGE 模型将查询向量化，在 Chroma 集合中做相似度检索，
-    将 top_k 条结果格式化为 LLM 可直接阅读的字符串。
+    """语义检索并格式化为 LLM 可读文本。
 
     参数:
-        query: 自然语言查询，如"川菜有什么特点"、"糖尿病患者能吃什么"
-        collection: 知识集合名称，可选 dish_knowledge / dietary_knowledge / faq
-        top_k: 返回条数，默认5
+        query: 自然语言查询
+        collection: 物理集合名
+        top_k: 候选条数
+        logical_type: 逻辑知识类型 dish/dietary/faq；缺省时按集合名推断
+        min_score: COSINE 相似度下限，低于此值视为无关被过滤
 
     返回:
-        格式化的检索结果字符串。若无结果或知识库不可用，返回友好的中文提示。
+        格式化文本（可能是“未找到足够相关内容”）。
+        集合未构建抛 KnowledgeNotBuilt；Milvus 故障抛 KnowledgeStoreError，
+        交由工具层/健康检查区分处理，绝不伪装成“没有知识”。
     """
-    # 1. 获取向量存储
+    rag_id = trace_id or uuid.uuid4().hex[:8]
+    lt = logical_type or logical_type_of(collection)
+    safe_query = " ".join(query.split())[:120]
+    started = time.perf_counter()
+    logger.info(
+        "[RAG][%s] START type=%s collection=%s top_k=%d min_score=%.3f query=%r",
+        rag_id, lt, collection, top_k, min_score, safe_query,
+    )
+
     store = _get_vector_store(collection)
     if store is None:
-        collection_names = {
-            "dish_knowledge": "菜品知识库",
-            "dietary_knowledge": "饮食健康知识库",
-            "faq": "常见问题知识库",
-        }
-        cn_name = collection_names.get(collection, collection)
-        return (
-            f"知识库（{cn_name}）暂不可用，可能是因为还没有构建向量数据库。\n"
-            f"请运行以下命令构建知识库:\n"
-            f"  python build_knowledge_base.py\n"
-            f"如果尚未下载嵌入模型，请先安装 modelscope:\n"
-            f"  pip install modelscope"
+        cn = _LOGICAL_META.get(logical_type or logical_type_of(collection), {}).get(
+            "empty_name", collection
+        )
+        raise KnowledgeNotBuilt(
+            f"知识库（{cn}，集合 {collection}）尚未构建或为空。"
+            f"请先运行 python build_knowledge_base.py 并确认 Milvus 已启动。"
         )
 
-    # 2. 执行相似度检索
     try:
-        docs = store.similarity_search_with_score(query, k=top_k)
+        hits = _similarity_search(store, collection, query, top_k, rag_id=rag_id)
+    except KnowledgeStoreError:
+        logger.exception("[RAG][%s] FAILED collection=%s", rag_id, collection)
+        raise
     except Exception as e:
-        print(f"[RAG] 检索异常: {e}")
-        return "知识库检索时出现异常，请稍后再试。"
+        logger.exception("[RAG][%s] FAILED collection=%s", rag_id, collection)
+        raise KnowledgeStoreError(f"检索集合 {collection} 失败：{type(e).__name__}: {e}") from e
 
-    # 3. 格式化结果
-    if not docs:
-        return "抱歉，没有在知识库中找到相关信息。您可以换个说法试试，或者告诉我更具体的需求。"
+    # COSINE：越大越相似；过滤低相关结果
+    scored = [(doc, float(score)) for doc, score in hits if float(score) >= min_score]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    candidate_scores = ",".join(f"{float(score):.3f}" for _, score in hits) or "none"
+    logger.info(
+        "[RAG][%s] FILTER candidates=%d accepted=%d threshold=%.3f scores=[%s]",
+        rag_id, len(hits), len(scored), min_score, candidate_scores,
+    )
 
-    source_labels = {
-        "dish_knowledge": "菜品知识",
-        "dietary_knowledge": "饮食知识",
-        "faq": "常见问题",
-    }
-    source_label = source_labels.get(collection, collection)
+    if not scored:
+        logger.info(
+            "[RAG][%s] FINISH accepted=0 elapsed_ms=%.0f",
+            rag_id, (time.perf_counter() - started) * 1000,
+        )
+        return "未在知识库中找到与该问题足够相关的内容，不要据此编造答案，可改用实时查询或提示用户换个问法。"
 
-    lines = [f"为您找到以下{source_label}（共{len(docs)}条）："]
-    for i, (doc, score) in enumerate(docs, 1):
-        # 相似度分数越小表示越相关（余弦距离），转换为易读标记
-        if score < 0.3:
-            relevance = "★★★ 高度相关"
-        elif score < 0.6:
-            relevance = "★★☆ 相关"
-        else:
-            relevance = "★☆☆ 低相关"
-
+    label = _LOGICAL_META.get(lt, {}).get("label", "知识")
+    lines = [f"为您找到以下{label}（共{len(scored)}条，按相关度排序）："]
+    for i, (doc, score) in enumerate(scored, 1):
         metadata = doc.metadata or {}
-        meta_hint = ""
-        if collection == "dish_knowledge":
-            name = metadata.get("name", "")
-            category = metadata.get("category", "")
-            if name:
-                meta_hint = f"【{name}】"
-            if category:
-                meta_hint += f"[{category}] "
-        elif collection == "dietary_knowledge":
-            condition = metadata.get("condition", "")
-            if condition:
-                meta_hint = f"【{condition}】"
-        elif collection == "faq":
-            category = metadata.get("category", "")
-            if category:
-                meta_hint = f"【{category}】"
-
+        hint = _format_meta_hint(lt, metadata)
         lines.append(
-            f"  {i}. {meta_hint}（{relevance}）\n"
+            f"  {i}. {hint}（{_relevance_stars(score)}，相似度{score:.3f}）\n"
             f"     {doc.page_content.strip()[:300]}"
         )
-
+    logger.info(
+        "[RAG][%s] FINISH accepted=%d elapsed_ms=%.0f",
+        rag_id, len(scored), (time.perf_counter() - started) * 1000,
+    )
     return "\n".join(lines)
+
+
+# ==================== 健康状态 ====================
+
+def rag_status() -> dict:
+    """供健康接口：Milvus 连通性、三个集合是否存在及计数。"""
+    collections = list(RAG_KNOWLEDGE_COLLECTIONS.values())
+    up = ping_milvus()
+    detail = {}
+    if up:
+        for name in collections:
+            try:
+                detail[name] = collection_count(name) if collection_exists(name) else -1
+            except KnowledgeStoreError:
+                detail[name] = -1
+    return {
+        "milvus_up": up,
+        "milvus_uri": MILVUS_URI,
+        "metric_type": RAG_METRIC_TYPE,
+        "collections": detail,
+        "ready": up and all(c > 0 for c in detail.values()) if up else False,
+    }

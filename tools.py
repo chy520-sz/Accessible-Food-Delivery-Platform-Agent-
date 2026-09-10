@@ -331,14 +331,17 @@ def get_user_addresses(session_id: str) -> str:
         return f"查询地址失败：{str(e)}"
 
 
-def place_order(session_id: str, address_id: int, remark: str = "") -> str:
+def place_order(session_id: str, address_id: int, remark: str = "",
+                idempotency_key: str = "") -> str:
     """提交下单。
     系统会自动从购物车读取菜品并计算总价，下单后购物车自动清空。
-    此操作**不自动重试**，避免网络抖动导致重复下单。
+    此操作**不自动重试**，并通过 idempotency_key 做服务端幂等，
+    同一次已确认订单重复请求复用同一幂等键，避免重复下单。
 
     参数:
         address_id: 收货地址ID数字（需先通过 get_user_addresses 获取）
         remark: 订单备注，如"少辣"、"不要香菜"等
+        idempotency_key: 服务端待确认订单派生的稳定幂等键
 
     返回:
         下单结果文本，包含订单编号和金额。
@@ -347,6 +350,8 @@ def place_order(session_id: str, address_id: int, remark: str = "") -> str:
         body = {"addressId": address_id}
         if remark:
             body["remark"] = remark
+        if idempotency_key:
+            body["idempotencyKey"] = idempotency_key
         result = bc.post("/api/user/orders", session_id, body)
         order = bc.extract_data(result)
         order_no = order.get("orderNo", "未知")

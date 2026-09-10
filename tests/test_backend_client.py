@@ -54,3 +54,38 @@ def test_is_retryable(monkeypatch):
     assert bc._is_retryable(r500)
     r400 = HTTPStatusError("e", request=req, response=Response(400, request=req))
     assert not bc._is_retryable(r400)
+
+
+def test_clear_session():
+    bc.set_session("sc", {"token": "t", "expires_at": time.time() + 100})
+    bc.clear_session("sc")
+    assert bc.get_session("sc") is None
+
+
+def test_get_all_pages_aggregates(monkeypatch):
+    """Java 默认每页 10 条，必须翻页拉全，直到取满 total。"""
+    pages = {
+        1: {"code": 200, "data": {"records": [{"id": i} for i in range(10)], "total": 15}},
+        2: {"code": 200, "data": {"records": [{"id": i} for i in range(10, 15)], "total": 15}},
+    }
+
+    def fake_get(path, session_id, params=None):
+        return pages[params["page"]]
+
+    monkeypatch.setattr(bc, "get", fake_get)
+    rows = bc.get_all_pages("/api/user/dishes", "s", page_size=10)
+    assert [r["id"] for r in rows] == list(range(15))
+
+
+def test_get_all_pages_stops_on_short_page(monkeypatch):
+    """返回条数小于 pageSize 时立即停止，避免无意义翻页。"""
+    calls = []
+
+    def fake_get(path, session_id, params=None):
+        calls.append(params["page"])
+        return {"code": 200, "data": {"records": [{"id": 1}, {"id": 2}], "total": 2}}
+
+    monkeypatch.setattr(bc, "get", fake_get)
+    rows = bc.get_all_pages("/x", "s", page_size=10)
+    assert len(rows) == 2
+    assert calls == [1]

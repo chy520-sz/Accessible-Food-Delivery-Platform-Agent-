@@ -3,6 +3,7 @@ FastAPI 主入口 —— 小鹿 AI 语音Agent服务（端口 8000）。
 
 接口列表:
   POST /agent/text     — 文本对话（JSON in / JSON out）
+  POST /agent/tts      — 统一文字播报（JSON in / MP3 out）
   POST /agent/voice    — 语音对话（音频 in / MP3 out）
   GET  /agent/health   — 服务健康检查
 
@@ -40,21 +41,22 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent import (
     chat,
     cleanup_sessions,
+    delete_session,
     get_agent_status,
     get_or_create_session,
     shutdown as agent_shutdown,
     sync_login_token,
-    _sessions,
 )
 from config import (
     AGENT_CORS_ORIGINS,
     AGENT_HOST,
     AGENT_MAX_AUDIO_BYTES,
+    AGENT_MAX_TTS_CHARS,
     AGENT_PORT,
     AGENT_RATE_LIMIT_PER_MINUTE,
     AGENT_RELOAD,
@@ -62,6 +64,7 @@ from config import (
     SESSION_CLEANUP_INTERVAL,
 )
 from speech import recognize_speech, synthesize_speech
+from text_utils import clean_text_for_tts
 
 # 修复[错误分级]：配置日志，记录完整错误上下文
 logger = logging.getLogger("main")
@@ -108,7 +111,7 @@ async def lifespan(app: FastAPI):
             await cleanup_task
         except asyncio.CancelledError:
             pass
-        agent_shutdown()
+        await agent_shutdown()
         logger.info("[main] Agent 服务关闭，资源已释放")
 
 
@@ -237,6 +240,11 @@ class TextRequest(BaseModel):
     auth_token: Optional[str] = None  # JWT token（从外卖平台前端传递）
 
 
+class TtsRequest(BaseModel):
+    """统一文字转语音请求体。"""
+    text: str = Field(min_length=1, max_length=AGENT_MAX_TTS_CHARS)
+
+
 class TextResponse(BaseModel):
     """文本对话响应体"""
     code: int = 200
@@ -255,6 +263,11 @@ class HealthResponse(BaseModel):
     active_sessions: int
     llm_connected: bool
     java_backend: str
+    # RAG（Milvus + 嵌入）就绪状态
+    milvus_up: bool = False
+    rag_ready: bool = False
+    embedding_ok: bool = False
+    rag_collections: dict = {}
 
 
 # ==================== 接口实现 ====================
@@ -274,7 +287,7 @@ async def agent_sync(req: SyncRequest):
       { "code": 200, "session_id": "abc123", "reply": "登录态已同步", "is_new_session": false }
     """
     sess = get_or_create_session(req.session_id)
-    logged_in, username = sync_login_token(sess.session_id, req.auth_token)
+    logged_in, username = await sync_login_token(sess.session_id, req.auth_token)
     if req.auth_token and logged_in:
         msg = f"已同步登录态，欢迎 {username}"
     elif req.auth_token:
@@ -288,9 +301,18 @@ async def agent_sync(req: SyncRequest):
         is_new_session=req.session_id is None,
     )
 
+# Depends依赖注入：调用我的函数之前，先解决这个前置条件
 
-@app.post("/agent/text", response_model=TextResponse, dependencies=[Depends(require_service_key)])
-async def agent_text(req: TextRequest):
+# @装饰器：把下面那个函数作为参数，传给装饰器函数，不是 "现在执行这个函数"，而是 "登记这个函数"**。函数体要等请求来了才运行
+
+# response_model:
+# 1. **过滤**：函数 return 的东西里，凡是模型里没有的字段会被丢掉（防止泄露内部字段）；
+# 2. **校验 + 类型转换**：保证响应一定符合 `TextResponse` 的字段类型；
+# 3. **文档**：`/docs` 自动生成的 OpenAPI 文档里会写出这个响应结构。
+
+# @app.post:只要有人用 POST 方法访问 `/agent/text` 这个地址，就把请求交给下面这个函数处理
+@app.post("/agent/text", response_model=TextResponse, dependencies=[Depends(require_service_key)]) # 这行只在启动时执行一次，作用是"登记"
+async def agent_text(req: TextRequest):     # ← 这个函数体，只有请求来了才执行
     """文本对话接口。
 
     用户发送文字消息，Agent 返回文字回复。
@@ -325,6 +347,23 @@ async def agent_text(req: TextRequest):
         is_new_session=result["is_new_session"],
         trace_id=result.get("trace_id", ""),
     )
+
+
+@app.post("/agent/tts", dependencies=[Depends(require_service_key)])
+async def agent_tts(req: TtsRequest):
+    """将系统提示或文字对话统一合成为小鹿音色的 MP3。"""
+    tts_text = clean_text_for_tts(req.text).strip()
+    if not tts_text:
+        raise HTTPException(status_code=400, detail="播报文本不能为空")
+    started = time.perf_counter()
+    mp3_bytes = await synthesize_speech(tts_text)
+    if not mp3_bytes:
+        raise HTTPException(status_code=503, detail="语音合成暂时不可用")
+    logger.info(
+        "[tts] 合成完成 chars=%d bytes=%d elapsed_ms=%.0f",
+        len(tts_text), len(mp3_bytes), (time.perf_counter() - started) * 1000,
+    )
+    return Response(content=mp3_bytes, media_type="audio/mpeg")
 
 
 @app.post("/agent/voice", dependencies=[Depends(require_service_key)])
@@ -411,11 +450,14 @@ async def agent_health():
 
 @app.delete("/agent/session/{session_id}", dependencies=[Depends(require_service_key)])
 async def agent_session_delete(session_id: str):
-    """清除指定会话（主要用于调试）。"""
-    if session_id in _sessions:
-        del _sessions[session_id]
-        return JSONResponse({"code": 200, "message": f"会话 {session_id} 已清除"})
-    return JSONResponse({"code": 404, "message": f"会话 {session_id} 不存在"})
+    """清除指定会话：联动清理 JWT、checkpoint 历史、锁与待确认订单。"""
+    existed = delete_session(session_id)
+    if existed:
+        return JSONResponse({"code": 200, "message": f"会话 {session_id} 及其登录态/历史已清除"})
+    return JSONResponse(
+        status_code=404,
+        content={"code": 404, "message": f"会话 {session_id} 不存在"},
+    )
 
 
 # ==================== 启动入口 ====================

@@ -43,6 +43,11 @@ def get_session(session_id: str) -> Optional[dict]:
     return sess
 
 
+def clear_session(session_id: str) -> None:
+    """彻底清除某会话的 JWT 登录信息（退出/换号/删除会话时调用）。"""
+    _session_store.pop(session_id, None)
+
+
 def purge_expired_sessions(now: Optional[float] = None) -> int:
     """清理所有已过期的会话 token 记录，返回清理条数。"""
     now = time.time() if now is None else now
@@ -77,6 +82,9 @@ def _get_client() -> httpx.Client:
         _client = httpx.Client(
             verify=SSL_VERIFY,
             timeout=httpx.Timeout(15.0, connect=10.0),
+            # Java 后端是本机/内网服务，不能继承系统 HTTP 代理，否则
+            # localhost 未启动时会得到代理的 502，启动后也可能绕错链路。
+            trust_env=False,
         )
     return _client
 
@@ -226,6 +234,42 @@ def extract_records(data: object) -> list:
         records = data.get("records")
         return records if isinstance(records, list) else []
     return []
+
+
+def get_all_pages(
+    path: str,
+    session_id: str,
+    page_size: int = 50,
+    extra_params: Optional[dict] = None,
+    max_pages: int = 200,
+) -> list:
+    """按 page/pageSize 拉取全量分页记录（Java 默认每页 10 条，单次请求会漏数据）。
+
+    兼容分页对象 {records,total} 与直接返回列表；遇到空页或取满 total 即停止。
+    """
+    all_records: list = []
+    for page in range(1, max_pages + 1):
+        params = {"page": page, "pageSize": page_size}
+        if extra_params:
+            params.update(extra_params)
+        result = get(path, session_id, params=params)
+        data = extract_data(result)
+        if isinstance(data, list):
+            page_records = data
+            total = len(data)
+        elif isinstance(data, dict):
+            page_records = data.get("records", []) or []
+            total = data.get("total", None)
+        else:
+            break
+        if not page_records:
+            break
+        all_records.extend(page_records)
+        if isinstance(total, int) and len(all_records) >= total:
+            break
+        if len(page_records) < page_size:
+            break
+    return all_records
 
 
 # ==================== JWT 后端验证 ====================

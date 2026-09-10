@@ -1,254 +1,190 @@
-# 无障碍外卖 Agent 完全体
+# 小鹿 AI Agent
 
-## 2026-08-03 Agent 端优化
-
-本轮针对 Agent 端做了一轮架构与可靠性优化，要点如下：
-
-### 真实链路打通
-- 新增 `query_order_status` 工具：查询订单真实配送状态（商家接单/骑手分配/预计送达/关键时间点），
-  对接 Java 后端 `GET /api/agent/orders/{id}/status`。
-- 商家接单/配送/完成三个桥接工具（`merchant_accept_order`、`delivery_pickup_order`、
-  `delivery_complete_order`）现在同时携带**用户 JWT + X-Agent-Key** 调用 Java 后端，
-  不再因缺少用户令牌而 401。
-- `delivery_pickup_order` 按 Java 后端真实返回字段解析，不再播报"配送员 N/A"。
-- `simulate_multi_agent` 明确为**仅演示**用途（虚构数据），提示词与工具描述双重约束，
-  真实订单进度一律走 `query_order_status`。
-- 饮食计划生成后自动调用 `save_diet_plan` 落库（后端未实现时返回保存提示，不影响计划内容）。
-- 注意：`AGENT_API_KEY` 必须与 Java 后端 `agent.api-key` 一致（默认 `agent-demo-key-2026`），
-  已写入 `.env` 与 `.env.example`。
-
-### 下单防重
-- 所有 POST/PUT/DELETE 变更操作**不再自动重试**（防止响应丢失时重复下单/重复加购/重复评分）；
-  仅 GET 查询保留超时/5xx 安全重试。
-
-### 资源治理
-- 会话按 `SESSION_EXPIRE_SECONDS` 定期清理（后台任务，间隔 `SESSION_CLEANUP_INTERVAL`），
-  释放内存与 AgentExecutor；过期 JWT 一并清除。
-- LLM 与 httpx 客户端改为进程内单例（`llm_client.py`），服务关闭时统一释放；
-  饮食计划生成复用同一套客户端。
-- TTS 改为异步子进程（`asyncio.create_subprocess_exec`），不再阻塞事件循环。
-- 健康检查不再每次真调大模型：LLM 健康状态缓存 `LLM_HEALTH_TTL` 秒，
-  Java 后端探活带 30 秒缓存。
-
-### 安全收敛
-- 配置 `AGENT_SERVICE_API_KEY` 后，所有 `/agent/*` 接口要求 `X-Agent-Key` 请求头
-  （留空为开发模式，启动时打印警告）。
-- 按来源 IP 对 `/agent/*` 限流（`AGENT_RATE_LIMIT_PER_MINUTE`，健康检查除外）。
-- 语音上传限制大小（默认 10MB，`AGENT_MAX_AUDIO_BYTES`）与格式（wav/pcm）。
-- CORS 白名单收敛为 `AGENT_CORS_ORIGINS`（不再使用 `*`）。
-- 登录态同步改为**后端真实校验 JWT**（`backend_client.validate_user_token`），
-  不再信任客户端直接传来的 payload；过期时间以 token `exp` 与配置取较小值。
-
-### 工程化
-- 新增 `backend_client.py` 统一 HTTP 客户端，`tools.py` 与 `health_tools.py` 共用，
-  删除重复封装（此前两套重试策略不一致）。
-- 新增 `text_utils.py`（TTS 文本清理独立模块）、`llm_client.py`（LLM 单例）。
-- 清理死代码：未使用的导入/函数（`get_dish_nutrition`、`is_knowledge_base_ready`、
-  `format_plan_for_tts` 改为实际使用等）。
-- 新增单元测试（`tests/`）、`pyproject.toml`（ruff + pytest 配置）、`requirements-dev.txt`。
-- 新增 `sync_dish_knowledge.py`：知识库 JSON 去重校验 + 与后端实时菜品对齐（可选登录）。
-
-### 运行与验证
-
-```powershell
-# 语法检查
-python -m py_compile main.py agent.py tools.py health_tools.py health_validator.py diet_planner.py knowledge_base.py build_knowledge_base.py speech.py config.py
-
-# 单元测试（需 pip install -r requirements-dev.txt）
-python -m pytest
-
-# 代码检查
-python -m ruff check .
-```
-
-## 2026-06-08 骑手端补充
-
-项目组成新增：
-
-```text
-take-out/rider   # 骑手端 Vue 3 + Vite + TypeScript + Pinia + Element Plus
-```
-
-本地端口新增：
-
-| 服务 | 地址 |
-| --- | --- |
-| 骑手端 | `http://localhost:5176` |
-
-启动骑手端：
-
-```powershell
-cd take-out/rider
-npm install
-npm run dev
-```
-
-已有数据库升级需要执行：
-
-```sql
-source take-out/server/src/main/resources/sql/migrate_add_rider_portal.sql;
-```
-
-默认测试骑手账号：
-
-| 入口 | 手机号 | 密码 | 说明 |
-| --- | --- | --- | --- |
-| 骑手端 | `13800000004` | `admin123` | 默认测试骑手 |
-
-新增接口：
-
-- `POST /api/auth/rider/register`
-- `POST /api/auth/rider/login`
-- `GET /api/rider/dashboard`
-- `GET /api/rider/orders/available`
-- `POST /api/rider/orders/{id}/accept`
-- `GET /api/user/orders/current`
-- `GET /api/rider/orders`
-- `GET /api/rider/orders/{id}`
-- `PUT /api/rider/orders/{id}/status`
-
-骑手端工作台能力：
-
-- 首页统计：今日配送收入、今日完成订单、进行中订单、超时订单、可接订单
-- 可接订单池：展示未分配订单并支持手动接单
-- 我的订单：支持状态筛选和超时筛选
-- 订单详情：展示配送费、预约配送时间、下单/分配/取餐/送达/完成时间
-- 配送费字段：`orders.delivery_fee`，默认 5.00
-
-面向视障人群的自动化外卖点餐系统，包含外卖业务前后端、店铺端、管理端和语音 Agent 辅助服务。项目重点解决视障用户在浏览菜品、语音交互、加入购物车、下单确认、订单查询和评分推荐中的可访问性问题。
-
-## 项目组成
-
-```text
-Agent完全体/
-├── take-out/        # Java 后端 + 用户端 + 管理端 + 店铺端
-├── take-out Agent/  # Python FastAPI 语音 Agent 服务
-└── references/      # 项目知识库，记录架构、接口和历史决策
-```
-
-## 核心功能
-
-- 用户端：无障碍点餐、菜品/套餐浏览、购物车、地址、订单、评分、语音引导和 Agent 对话。
-- 店铺端：店铺账号登录、店铺工作台、本店菜品管理、本店套餐管理、本店订单和营业额统计。
-- 管理端：超级管理员登录、全局查看用户/店铺/菜品/套餐/订单，菜品和套餐仅允许上下架。
-- Java 后端：统一 REST API、JWT 鉴权、角色隔离、MySQL 数据持久化、Redis 缓存。
-- Agent 服务：文本/语音对话、登录态同步、调用 Java 后端工具完成点餐和推荐。
+面向无障碍外卖场景的独立 Agent 服务，提供文字对话、语音识别、统一语音合成和 RAG 知识检索。
 
 ## 技术栈
 
-| 模块 | 技术 |
-| --- | --- |
-| 后端 | Java 17, Spring Boot 3.2.5, MyBatis-Plus, MySQL, Redis, JWT, BCrypt |
-| 用户端 | Vue 3, Vite, TypeScript, Pinia, Element Plus |
-| 管理端 | Vue 3, Vite, TypeScript, Pinia, Element Plus, ECharts |
-| 店铺端 | Vue 3, Vite, TypeScript, Pinia, Element Plus, ECharts |
-| Agent | Python, FastAPI, LangChain, DeepSeek 兼容 OpenAI 接口, edge-tts |
+- Python 3.11
+- FastAPI + Uvicorn
+- LangChain 1.2 + LangGraph
+- DeepSeek Chat
+- Milvus + `pymilvus`
+- `qwen3.7-text-embedding-flash`，1024 维
+- 阿里云智能语音 ASR
+- Edge TTS
 
-## 本地端口
+## 目录
 
-| 服务 | 地址 |
-| --- | --- |
-| Java 后端 | `http://localhost:3000` |
-| Agent 服务 | `http://localhost:8000` |
-| 管理端 | `http://localhost:5173` |
-| 店铺端 | `http://localhost:5174` |
-| 用户端 | `http://localhost:5175` |
+```text
+take-out Agent/
+├─ main.py                    # FastAPI 入口
+├─ agent.py                   # Agent、工具与会话管理
+├─ config.py                  # 环境变量
+├─ knowledge_base.py          # Milvus 检索
+├─ embedding_client.py        # Qwen Embedding 客户端
+├─ build_knowledge_base.py    # 知识库构建
+├─ check_rag.py               # RAG 自检
+├─ speech.py                  # ASR 与 TTS
+├─ knowledge/                 # JSON 知识源
+├─ tests/                     # 单元测试
+└─ docker-compose.milvus.yml  # Milvus Standalone
+```
 
-## 快速启动
+## 环境准备
 
-### 1. 启动 Java 后端和前端
-
-详细步骤见 [take-out/README.md](./take-out/README.md)。
-
-常用命令：
+项目使用 Conda 环境 `D:\anaconda3\envs\take-out`。
 
 ```powershell
-cd take-out/server
-mvn spring-boot:run
-
-cd ../client
-npm install
-npm run dev
-
-cd ../admin
-npm install
-npm run dev
-
-cd ../shop
-npm install
-npm run dev
+cd "D:\java code\takeout\take-out Agent"
+D:\anaconda3\envs\take-out\python.exe -m pip install -r requirements-dev.txt
+D:\anaconda3\envs\take-out\python.exe -m pip check
+Copy-Item .env.example .env
 ```
 
-### 2. 启动 Agent 服务
+`.env` 至少填写：
+
+```env
+DEEPSEEK_API_KEY=你的DeepSeek密钥
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+LLM_MODEL=deepseek-chat
+
+DASHSCOPE_API_KEY=你的百炼密钥
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/api/v1
+RAG_EMBEDDING_MODEL=qwen3.7-text-embedding-flash
+RAG_EMBEDDING_DIMENSIONS=1024
+
+MILVUS_URI=http://localhost:19530
+MILVUS_DB_NAME=default
+```
+
+启用语音识别时填写：
+
+```env
+ALIYUN_ACCESS_KEY_ID=你的AccessKeyId
+ALIYUN_ACCESS_KEY_SECRET=你的AccessKeySecret
+ALIYUN_ASR_APP_KEY=你的Appkey
+```
+
+语音合成可选配置：
+
+```env
+TTS_VOICE=zh-CN-XiaoxiaoNeural
+TTS_RATE=-10%
+```
+
+不要提交包含真实密钥的 `.env`。
+
+## 启动 Milvus
 
 ```powershell
-cd "take-out Agent"
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-python main.py
+docker ps --filter name=milvus-standalone
 ```
 
-启动前需要在 `.env` 中配置大模型 API Key；如需语音识别，还需要配置阿里云智能语音相关参数。
-
-## 数据库
-
-全新数据库使用：
-
-```sql
-source take-out/server/src/main/resources/sql/init.sql;
-```
-
-已有数据库升级时，按功能执行对应迁移脚本，例如：
-
-```sql
-source take-out/server/src/main/resources/sql/migrate_add_shop_portal.sql;
-```
-
-## 默认测试账号
-
-| 入口 | 手机号 | 密码 | 说明 |
-| --- | --- | --- | --- |
-| 用户端 | `13900000000` | `123456` | 测试用户 |
-| 管理端 | `13800000000` | `admin123` | 超级管理员 |
-| 店铺端 | `13800000001` | `admin123` | 暖心食堂店铺账号 |
-| 店铺端 | `13800000002` | `admin123` | 巷口面馆店铺账号 |
-| 店铺端 | `13800000003` | `admin123` | 甜饮小站店铺账号 |
-
-## 权限边界
-
-- 管理端只能全局查看菜品/套餐，并只能控制上下架，不能新增、编辑、删除菜品或套餐。
-- 店铺端只能访问当前登录店铺的数据，后端从 JWT 中读取 `shopId`，不信任前端传入的店铺 ID。
-- 用户端和店铺端的登录态使用 `sessionStorage`，同一浏览器不同标签页登录不同账号时互不覆盖。
-- 营业额统计仅店铺端可见，管理端不展示营业额。
-- 营业状态不由管理端维护。
-
-## 构建验证
+如果未显示 `healthy`：
 
 ```powershell
-cd take-out/server
-mvn -q -DskipTests clean compile
-
-cd ../client
-npm run build
-
-cd ../admin
-npm run build
-
-cd ../shop
-npm run build
+cd "D:\java code\takeout\take-out Agent"
+docker compose -f docker-compose.milvus.yml up -d
 ```
 
-Agent 语法检查：
+默认连接地址为 `http://localhost:19530`。
+
+## 构建 RAG 知识库
+
+首次运行或知识源发生变化时执行：
 
 ```powershell
-cd "take-out Agent"
-python -m py_compile main.py agent.py tools.py prompts.py speech.py config.py
+cd "D:\java code\takeout\take-out Agent"
+
+# 只检查知识源，不连接 Milvus、不调用 Embedding
+D:\anaconda3\envs\take-out\python.exe build_knowledge_base.py --dry-run
+
+# 构建全部集合并自检
+D:\anaconda3\envs\take-out\python.exe build_knowledge_base.py
+D:\anaconda3\envs\take-out\python.exe check_rag.py
 ```
 
-## 注意事项
+只构建指定集合：
 
-- 不要提交真实的 `application.yml`、`.env`、Token、AccessKey 或 API Key。
-- 如果出现 `Unknown column ...`，优先检查当前 MySQL 库是否执行了最新迁移脚本。
-- 前端端口都启用了 `strictPort`，端口被占用时会直接失败，避免访问到错误前端。
+```powershell
+D:\anaconda3\envs\take-out\python.exe build_knowledge_base.py --only dish
+D:\anaconda3\envs\take-out\python.exe build_knowledge_base.py --only dietary
+D:\anaconda3\envs\take-out\python.exe build_knowledge_base.py --only faq
+```
+
+| 类型 | 默认集合 |
+|---|---|
+| 菜品 | `takeout_dish_qwen37_1024_v1` |
+| 饮食健康 | `takeout_dietary_qwen37_1024_v1` |
+| 常见问题 | `takeout_faq_qwen37_1024_v1` |
+
+## 启动 Agent
+
+```powershell
+cd "D:\java code\takeout\take-out Agent"
+D:\anaconda3\envs\take-out\python.exe main.py
+```
+
+- API 文档：<http://localhost:8000/docs>
+- 健康检查：<http://localhost:8000/agent/health>
+
+端口被占用时停止旧进程：
+
+```powershell
+$agentPid = (Get-NetTCPConnection -LocalPort 8000 -State Listen).OwningProcess
+Stop-Process -Id $agentPid
+```
+
+## API
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| POST | `/agent/sync` | 同步或清除登录态 |
+| POST | `/agent/text` | 文字对话 |
+| POST | `/agent/tts` | 将文字合成为小鹿音色 MP3 |
+| POST | `/agent/voice` | ASR → Agent → TTS 语音对话 |
+| GET | `/agent/health` | 服务、模型和 RAG 状态 |
+| DELETE | `/agent/session/{session_id}` | 删除会话与历史 |
+
+本地开发可将 `AGENT_SERVICE_API_KEY` 留空。生产环境应配置该值，并由可信调用方携带 `X-Agent-Key`。
+
+## RAG 日志
+
+菜品搜索固定执行 Milvus RAG 与实时检索。同一次调用使用相同 ID 串联日志：
+
+```text
+[RAG tool][b8fc73cf] type=dish query='牛肉'
+[RAG][b8fc73cf] START
+[RAG][b8fc73cf] EMBEDDING_DONE dim=1024 elapsed_ms=1038
+[RAG][b8fc73cf] MILVUS_DONE candidates=8 elapsed_ms=334
+[RAG][b8fc73cf] FILTER candidates=8 accepted=8 scores=[...]
+[RAG][b8fc73cf] FINISH elapsed_ms=1486
+```
+
+日志不会输出 API Key 或向量原值。
+
+## 语音
+
+- `/agent/voice` 使用阿里云 ASR 识别 WAV/PCM，再由 Agent 回复并生成 MP3。
+- `/agent/tts` 与语音对话共用 `TTS_VOICE`，用于统一系统播报和文字对话音色。
+- Edge TTS 不可用时，调用方可降级到浏览器语音。
+
+## 验证
+
+```powershell
+cd "D:\java code\takeout\take-out Agent"
+D:\anaconda3\envs\take-out\python.exe -m pytest -q
+D:\anaconda3\envs\take-out\python.exe -m ruff check .
+D:\anaconda3\envs\take-out\python.exe -m pip check
+```
+
+当前基线：51 个单元测试通过，RAG 自检全部通过。
+
+## 常见问题
+
+- `Port 8000 is already in use`：停止旧 Agent 进程后重启。
+- `AGENT_SERVICE_API_KEY 未设置`：本地开发提示，不影响启动。
+- Milvus 集合为空：执行 `build_knowledge_base.py` 后再运行 `check_rag.py`。
+- Embedding 维度不匹配：确认模型与集合均为 1024 维，然后重新构建集合。
+- 阿里云 Token TLS 错误：代码会自动重试；持续失败时检查网络、系统时间和 `SSL_VERIFY`。
+- TTS 返回 403：确认已安装 `edge-tts==7.2.8`。

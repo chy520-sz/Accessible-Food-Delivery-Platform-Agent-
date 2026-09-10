@@ -16,6 +16,7 @@ import hmac
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -31,6 +32,7 @@ from config import (
     TTS_RATE,
     MAX_RETRIES,
     RETRY_DELAY,
+    SSL_VERIFY,
 )
 
 logger = logging.getLogger("speech")
@@ -89,14 +91,20 @@ def _get_aliyun_token() -> str:
     if _token_cache["token"] and now < _token_cache["expire_time"]:
         return _token_cache["token"]
 
-    # RPC 风格 API：Signature 在 query string 中，不在 Authorization 头
-    query_string, signature = _build_token_request()
-    url = f"{_TOKEN_API_URL}?{query_string}&Signature={_pop_encode(signature)}"
-
-    try:
-        with httpx.Client(timeout=10.0, verify=False) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
+    for attempt in range(1, MAX_RETRIES + 1):
+        # 每次重试都重新生成时间戳和 nonce，避免复用已经过期的签名。
+        query_string, signature = _build_token_request()
+        url = f"{_TOKEN_API_URL}?{query_string}&Signature={_pop_encode(signature)}"
+        try:
+            timeout = httpx.Timeout(15.0, connect=10.0)
+            with httpx.Client(
+                timeout=timeout,
+                verify=SSL_VERIFY,
+                trust_env=False,
+                http2=False,
+            ) as client:
+                resp = client.get(url)
+                resp.raise_for_status()
             data = resp.json()
             token_info = data.get("Token", {})
             token = token_info.get("Id", "")
@@ -106,37 +114,41 @@ def _get_aliyun_token() -> str:
             _token_cache["token"] = token
             _token_cache["expire_time"] = expire
             return token
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            # 打印完整响应用于调试
-            resp_body = e.response.text[:500] if e.response.text else "(空)"
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            if (status == 429 or status >= 500) and attempt < MAX_RETRIES:
+                logger.warning(
+                    "[ASR] Token 服务 HTTP %s，第 %d/%d 次请求失败，将重试",
+                    status, attempt, MAX_RETRIES,
+                )
+                time.sleep(RETRY_DELAY * attempt)
+                continue
+            if status == 404:
+                resp_body = e.response.text[:500] if e.response.text else "(空)"
+                raise RuntimeError(
+                    "获取阿里云语音 Token 失败 (404)。\n"
+                    f"响应内容: {resp_body}\n"
+                    "请确认智能语音交互服务已开通、RAM 用户已授予 "
+                    "AliyunNLSFullAccess，并检查 AccessKey。"
+                ) from e
             raise RuntimeError(
-                "获取阿里云语音 Token 失败 (404)。\n"
-                f"响应内容: {resp_body}\n"
-                f"请求 AccessKeyId: {ALIYUN_ACCESS_KEY_ID[:8]}***\n"
-                "\n"
-                "请按以下顺序逐一排查：\n"
-                "  1. 智能语音交互服务是否已开通？\n"
-                "     访问 https://ai.aliyun.com/nls 点击「开通并购买」\n"
-                "     （未开通时 API 网关直接返回 404，不会有其他错误码）\n"
-                "\n"
-                "  2. 该 AccessKey 对应的 RAM 用户是否已授权？\n"
-                "     登录 https://ram.console.aliyun.com/users\n"
-                "     找到该用户 → 添加权限 → 选择 AliyunNLSFullAccess\n"
-                "     （没有此权限时，API 同样返回 404 而非 403）\n"
-                "\n"
-                "  3. AccessKey ID / Secret 是否正确？\n"
-                "     Secret 在创建时仅显示一次，如果丢失需要重新创建\n"
-                "\n"
-                "验证方法：在控制台「智能语音交互 → 全部项目 → 点击项目名」\n"
-                "  页面右侧有「Token 生成器」，如果能成功生成 Token，\n"
-                "  则说明服务和权限没问题，再检查代码中的凭据是否复制正确。"
-            )
-        raise RuntimeError(
-            f"获取阿里云语音 Token 失败 (HTTP {e.response.status_code}): {e.response.text[:200]}"
-        )
-    except Exception as e:
-        raise RuntimeError(f"获取阿里云语音 Token 失败: {e}")
+                f"获取阿里云语音 Token 失败 (HTTP {status}): {e.response.text[:200]}"
+            ) from e
+        except httpx.TransportError as e:
+            if attempt < MAX_RETRIES:
+                logger.warning(
+                    "[ASR] Token 网络连接失败（%s），第 %d/%d 次，将重试",
+                    type(e).__name__, attempt, MAX_RETRIES,
+                )
+                time.sleep(RETRY_DELAY * attempt)
+                continue
+            raise RuntimeError(
+                f"获取阿里云语音 Token 失败：网络/TLS 连接连续失败 {MAX_RETRIES} 次（{type(e).__name__}）"
+            ) from e
+        except (ValueError, RuntimeError) as e:
+            raise RuntimeError(f"获取阿里云语音 Token 失败: {e}") from e
+
+    raise RuntimeError("获取阿里云语音 Token 失败：已超过最大重试次数")
 
 
 def _build_token_request() -> tuple[str, str]:
@@ -202,7 +214,8 @@ async def recognize_speech(audio_bytes: bytes, audio_format: str = "pcm") -> str
 
     _check_credentials()
 
-    token = _get_aliyun_token()
+    # Token 接口是同步 HTTP 调用，放入工作线程，避免阻塞 FastAPI 事件循环。
+    token = await asyncio.to_thread(_get_aliyun_token)
     app_key = ALIYUN_ASR_APP_KEY
 
     ws_url = (
@@ -332,9 +345,9 @@ async def recognize_speech(audio_bytes: bytes, audio_format: str = "pcm") -> str
 async def synthesize_speech(text: str) -> bytes:
     """使用 edge-tts 将文本合成为 MP3 音频。
 
-    edge-tts 使用微软免费的 Azure TTS 引擎，提供自然流畅的中文语音。
+    edge-tts 使用微软在线语音服务，提供自然流畅的中文语音。
     选用 zh-CN-XiaoxiaoNeural 音色（温暖活泼女声），语速稍慢适配视障用户。
-    使用 asyncio.create_subprocess_exec 异步执行，避免阻塞事件循环。
+    直接调用 Python API，避免依赖 PATH 中的 edge-tts.exe。
 
     参数:
         text: 要合成的文本内容
@@ -342,6 +355,7 @@ async def synthesize_speech(text: str) -> bytes:
     返回:
         MP3 格式的音频二进制数据。合成失败返回空字节。
     """
+    import edge_tts
     import tempfile
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -349,55 +363,38 @@ async def synthesize_speech(text: str) -> bytes:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
                 output_file = tmp.name
 
-            cmd = [
-                "edge-tts",
-                "--voice", TTS_VOICE,
-                "--rate=" + TTS_RATE,
-                "--text", text,
-                "--write-media", output_file,
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
             try:
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                communicate = edge_tts.Communicate(
+                    text=text,
+                    voice=TTS_VOICE,
+                    rate=TTS_RATE,
+                )
+                await asyncio.wait_for(communicate.save(output_file), timeout=30)
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
                 logger.warning("[TTS] 合成超时 (第%d次)", attempt)
                 _safe_remove(output_file)
                 if attempt >= MAX_RETRIES:
                     return b""
+                await asyncio.sleep(RETRY_DELAY * attempt)
                 continue
-            if proc.returncode != 0:
-                err = (stderr or b"").decode("utf-8", errors="replace").strip()
-                logger.warning("[TTS] 合成失败 (第%d次): %s", attempt, err)
-                _safe_remove(output_file)
-                if attempt < MAX_RETRIES:
-                    continue
-                return b""
 
-            if os.path.exists(output_file):
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
                 with open(output_file, "rb") as f:
                     audio_data = f.read()
                 _safe_remove(output_file)
                 return audio_data
             else:
-                logger.warning("[TTS] 输出文件未生成 (第%d次)", attempt)
+                logger.warning("[TTS] 输出文件为空或未生成 (第%d次)", attempt)
+                _safe_remove(output_file)
                 if attempt >= MAX_RETRIES:
                     return b""
-
-        except FileNotFoundError:
-            raise RuntimeError(
-                "未找到 edge-tts 命令。请先安装: pip install edge-tts\n"
-                "参考: https://github.com/rany2/edge-tts"
-            )
         except Exception as e:
-            logger.warning("[TTS] 异常: %s (第%d次)", e, attempt)
+            logger.warning("[TTS] 合成异常（%s，第%d/%d次）: %s", type(e).__name__, attempt, MAX_RETRIES, e)
+            if "output_file" in locals():
+                _safe_remove(output_file)
             if attempt >= MAX_RETRIES:
                 return b""
+            await asyncio.sleep(RETRY_DELAY * attempt)
     return b""
 
 

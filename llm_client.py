@@ -64,18 +64,42 @@ def get_llm() -> ChatOpenAI:
 
 
 def close_llm() -> None:
-    """关闭共享 LLM 及 httpx 客户端（服务关闭时调用）。"""
+    """同步关闭共享 LLM 及 httpx 客户端（非事件循环场景的兜底）。"""
     global _llm, _http_client, _async_http_client
     for client in (_http_client, _async_http_client):
         if client is not None:
             try:
                 client.close()
             except Exception:
-                pass
+                # 脱敏 debug 日志，禁止空 catch 吞掉问题
+                logger.debug("[llm] 同步关闭客户端时异常", exc_info=True)
     _llm = None
     _http_client = None
     _async_http_client = None
     logger.info("[llm] 已关闭共享 LLM 客户端")
+
+
+async def aclose_llm() -> None:
+    """在 FastAPI 生命周期中异步关闭。
+
+    httpx.AsyncClient 必须 await aclose()；直接对其调用同步 close()
+    会留下未关闭的事件循环资源并产生告警。
+    """
+    global _llm, _http_client, _async_http_client
+    if _http_client is not None:
+        try:
+            _http_client.close()
+        except Exception:
+            logger.debug("[llm] 关闭同步客户端异常", exc_info=True)
+    if _async_http_client is not None:
+        try:
+            await _async_http_client.aclose()
+        except Exception:
+            logger.debug("[llm] 异步关闭客户端异常", exc_info=True)
+    _llm = None
+    _http_client = None
+    _async_http_client = None
+    logger.info("[llm] 已异步关闭共享 LLM 客户端")
 
 
 def mark_llm_success() -> None:
@@ -113,7 +137,9 @@ async def probe_llm(ttl: float = 300.0) -> bool:
     try:
         llm = get_llm()
         resp = await llm.ainvoke("回复'OK'")
-        ok = isinstance(resp.content, str) and "OK" in resp.content
+        # 健康检查只判断服务是否能正常返回，不把模型是否严格照抄“OK”
+        # 当作连通性条件，避免一次措辞差异导致错误缓存为离线。
+        ok = isinstance(resp.content, str) and bool(resp.content.strip())
     except Exception as e:
         logger.warning("[llm_probe] 探测失败: %s", type(e).__name__)
         ok = False

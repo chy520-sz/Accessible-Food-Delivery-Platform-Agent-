@@ -68,15 +68,8 @@ def _validate_and_dedupe(entries: list[dict]) -> tuple[list[dict], list[str]]:
 
 
 def _fetch_backend_dishes(session_id: str) -> list[dict]:
-    """从 Java 后端拉取全部菜品（实时数据）。"""
-    result = bc.get("/api/user/dishes", session_id)
-    raw = bc.extract_data(result)
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        records = raw.get("records")
-        return records if isinstance(records, list) else []
-    return []
+    """从 Java 后端全量分页拉取菜品（默认每页 10 条，必须翻页拉全，不能只请求一次）。"""
+    return bc.get_all_pages("/api/user/dishes", session_id, page_size=50)
 
 
 def _login(phone: str, password: str) -> str:

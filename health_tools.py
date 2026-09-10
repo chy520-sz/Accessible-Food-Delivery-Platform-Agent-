@@ -17,9 +17,12 @@
 """
 
 import json
+import logging
 import os
 
 import backend_client as bc
+
+logger = logging.getLogger("health_tools")
 
 
 # ==================== 健康档案工具 ====================
@@ -322,16 +325,24 @@ def fetch_dishes_for_planning(session_id: str) -> str:
     dishes = []
     source = ""
 
-    # 方案1: 从 Java 后端获取（实时数据）
+    # 先加载本地知识，便于按真实菜品 ID 合并营养字段与标签（在线接口不返回这些）
+    kb_by_id: dict = {}
+    kb_path = os.path.join(os.path.dirname(__file__), "data", "dish_knowledge.json")
+    if os.path.exists(kb_path):
+        try:
+            with open(kb_path, "r", encoding="utf-8") as f:
+                for d in json.load(f):
+                    if d.get("dish_id") is not None:
+                        kb_by_id[d["dish_id"]] = d
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("[dishes] 读取本地菜品知识失败: %s", e)
+
+    # 方案1: 从 Java 后端全量分页获取实时菜品（默认每页 10 条，必须翻页拉全）
     try:
-        result = bc.get("/api/user/dishes", session_id)
-        raw = bc.extract_data(result)
-        records = []
-        if isinstance(raw, list):
-            records = raw
-        elif isinstance(raw, dict) and "records" in raw:
-            records = raw["records"]
-        for d in records:
+        online_records = bc.get_all_pages("/api/user/dishes", session_id, page_size=50)
+        for d in online_records:
+            kb = kb_by_id.get(d.get("id"), {})
+            nut = kb.get("nutrition", {}) or {}
             dishes.append({
                 "id": d.get("id"),
                 "name": d.get("name", "未知"),
@@ -339,21 +350,24 @@ def fetch_dishes_for_planning(session_id: str) -> str:
                 "price": d.get("price", 0),
                 "category": d.get("categoryName", ""),
                 "description": (d.get("description", "") or "")[:80],
-                "calories": None,  # Java API 不直接返回热量
-                "protein": None,
-                "carbs": None,
-                "fat": None,
-                "tags": [],
+                # 在线接口不返回营养/标签：按真实菜品 ID 与本地知识合并，未知则保留 None/[]
+                "calories": nut.get("calories"),
+                "protein": nut.get("protein"),
+                "carbs": nut.get("carbs"),
+                "fat": nut.get("fat"),
+                "tags": kb.get("tags", []) or [],
+                "suitable_for": kb.get("suitable_for", []) or [],
+                "allergens": kb.get("allergens", []) or [],
+                "spicy_level": kb.get("spicy_level", 0),
             })
         if dishes:
             source = "java_backend"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("[dishes] 在线拉取菜品失败，回退本地知识: %s", e)
 
     # 方案2: 回退到本地知识库 JSON（含完整营养数据）
     if not dishes:
         try:
-            kb_path = os.path.join(os.path.dirname(__file__), "data", "dish_knowledge.json")
             if os.path.exists(kb_path):
                 with open(kb_path, "r", encoding="utf-8") as f:
                     kb_dishes = json.load(f)
@@ -376,8 +390,8 @@ def fetch_dishes_for_planning(session_id: str) -> str:
                         "spicy_level": d.get("spicy_level", 0),
                     })
                 source = "knowledge_base"
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("[dishes] 读取本地菜品知识失败: %s", e)
 
     if not dishes:
         return json.dumps({"action": "error", "message": "暂时无法获取菜品数据，请稍后重试"}, ensure_ascii=False)
