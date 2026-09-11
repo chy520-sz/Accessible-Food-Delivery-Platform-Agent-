@@ -1,0 +1,5 @@
+# 开发/CI 依赖：在 requirements.txt 基础上追加测试与 lint 工具
+-r requirements.txt
+
+pytest>=8.0
+ruff>=0.6

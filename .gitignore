@@ -1,0 +1,43 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+.idea/
+.vscode/
+*.iml
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python virtualenvs and caches
+.venv/
+.venv-*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.embedding_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+build/
+*.egg-info/
+
+# Runtime logs and outputs
+*.log
+logs/
+tts_output/
+
+# Temporary files
+*.tmp
+*.temp
