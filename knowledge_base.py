@@ -37,6 +37,8 @@ from config import (
     MILVUS_DB_NAME,
     MILVUS_TOKEN,
     MILVUS_URI,
+    RAG_CALL_TIMEOUT,
+    RAG_FAILURE_COOLDOWN,
     RAG_KNOWLEDGE_COLLECTIONS,
     RAG_METRIC_TYPE,
     RAG_MIN_SCORE,
@@ -130,7 +132,9 @@ def ping_milvus() -> bool:
 def collection_exists(collection_name: str) -> bool:
     """集合是否存在（查询路径用它判断，避免 langchain 自动建集合）。"""
     try:
-        return bool(get_milvus_client().has_collection(collection_name))
+        return bool(get_milvus_client().has_collection(
+            collection_name, timeout=RAG_CALL_TIMEOUT
+        ))
     except KnowledgeStoreError:
         raise
     except Exception as e:
@@ -141,9 +145,9 @@ def collection_count(collection_name: str) -> int:
     """返回集合实体数（集合不存在返回 0）。"""
     try:
         client = get_milvus_client()
-        if not client.has_collection(collection_name):
+        if not client.has_collection(collection_name, timeout=RAG_CALL_TIMEOUT):
             return 0
-        stats = client.get_collection_stats(collection_name)
+        stats = client.get_collection_stats(collection_name, timeout=RAG_CALL_TIMEOUT)
         return int(stats.get("row_count", 0))
     except Exception as e:
         raise KnowledgeStoreError(f"读取集合 {collection_name} 计数失败：{e}") from e
@@ -152,6 +156,44 @@ def collection_count(collection_name: str) -> int:
 def reset_store_cache() -> None:
     """构建/删除集合后清空向量存储缓存。"""
     _store_cache.clear()
+    _failure_breaker.clear()
+
+
+# ==================== 失败快速熔断 ====================
+# Milvus 故障（如集合长期卡在 Loading）时，若每个请求都完整等一次超时，
+# 工具链会被反复拖慢，还会连带产生被中断的悬空工具调用。
+# 这里记录失败时间，冷却期内直接快速失败，冷却期后再给一次恢复机会。
+
+_failure_breaker: dict[str, float] = {}
+_breaker_lock = threading.Lock()
+
+
+def _breaker_blocked(collection: str) -> Optional[float]:
+    """返回剩余冷却秒数；未处于冷却期返回 None。"""
+    if RAG_FAILURE_COOLDOWN <= 0:
+        return None
+    now = time.monotonic()
+    with _breaker_lock:
+        failed_at = _failure_breaker.get(collection)
+        if failed_at is None:
+            return None
+        remaining = RAG_FAILURE_COOLDOWN - (now - failed_at)
+        if remaining <= 0:
+            _failure_breaker.pop(collection, None)
+            return None
+        return remaining
+
+
+def _breaker_record_failure(collection: str) -> None:
+    if RAG_FAILURE_COOLDOWN <= 0:
+        return
+    with _breaker_lock:
+        _failure_breaker[collection] = time.monotonic()
+
+
+def _breaker_record_success(collection: str) -> None:
+    with _breaker_lock:
+        _failure_breaker.pop(collection, None)
 
 
 def close_milvus_client() -> None:
@@ -181,11 +223,16 @@ def _get_vector_store(collection_name: str) -> Optional[MilvusClient]:
         store = get_milvus_client()
         if collection_count(collection_name) == 0:
             return None
-        store.load_collection(collection_name)
+        # 必须限时：集合卡在 Loading 时 load_collection 会无限等待，
+        # 进而拖满整轮对话预算，并让中断的 run 在 checkpoint 留下悬空工具调用。
+        store.load_collection(collection_name, timeout=RAG_CALL_TIMEOUT)
         _store_cache.add(collection_name)
         return store
     except Exception as e:
-        raise KnowledgeStoreError(f"加载集合 {collection_name} 失败：{type(e).__name__}: {e}") from e
+        raise KnowledgeStoreError(
+            f"加载集合 {collection_name} 失败（超时 {RAG_CALL_TIMEOUT}s）："
+            f"{type(e).__name__}: {e}"
+        ) from e
 
 
 # ==================== 结果格式化 ====================
@@ -249,6 +296,7 @@ def _similarity_search(
         limit=top_k,
         output_fields=["*"],
         search_params={"metric_type": RAG_METRIC_TYPE, "params": {}},
+        timeout=RAG_CALL_TIMEOUT,
     )
     hits = rows[0] if rows else []
     logger.info(
@@ -299,22 +347,37 @@ def search_knowledge(
         rag_id, lt, collection, top_k, min_score, safe_query,
     )
 
-    store = _get_vector_store(collection)
-    if store is None:
-        cn = _LOGICAL_META.get(logical_type or logical_type_of(collection), {}).get(
-            "empty_name", collection
+    remaining = _breaker_blocked(collection)
+    if remaining is not None:
+        logger.warning(
+            "[RAG][%s] SKIP collection=%s 处于失败冷却中（剩余 %.0fs），快速失败",
+            rag_id, collection, remaining,
         )
-        raise KnowledgeNotBuilt(
-            f"知识库（{cn}，集合 {collection}）尚未构建或为空。"
-            f"请先运行 python build_knowledge_base.py 并确认 Milvus 已启动。"
+        raise KnowledgeStoreError(
+            f"知识库集合 {collection} 最近检索失败，正在冷却（剩余约 {remaining:.0f}s）。"
         )
 
     try:
+        store = _get_vector_store(collection)
+        if store is None:
+            cn = _LOGICAL_META.get(logical_type or logical_type_of(collection), {}).get(
+                "empty_name", collection
+            )
+            raise KnowledgeNotBuilt(
+                f"知识库（{cn}，集合 {collection}）尚未构建或为空。"
+                f"请先运行 python build_knowledge_base.py 并确认 Milvus 已启动。"
+            )
         hits = _similarity_search(store, collection, query, top_k, rag_id=rag_id)
+        _breaker_record_success(collection)
+    except KnowledgeNotBuilt:
+        # 集合尚未构建不是故障，不进入冷却，便于构建后立即恢复
+        raise
     except KnowledgeStoreError:
+        _breaker_record_failure(collection)
         logger.exception("[RAG][%s] FAILED collection=%s", rag_id, collection)
         raise
     except Exception as e:
+        _breaker_record_failure(collection)
         logger.exception("[RAG][%s] FAILED collection=%s", rag_id, collection)
         raise KnowledgeStoreError(f"检索集合 {collection} 失败：{type(e).__name__}: {e}") from e
 

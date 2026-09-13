@@ -22,7 +22,7 @@ from typing import Optional
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
-from langchain_core.messages import HumanMessage, RemoveMessage
+from langchain_core.messages import HumanMessage, RemoveMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -254,9 +254,103 @@ async def _clear_conversation(sess: AgentSession) -> None:
         msgs = state.values.get("messages", [])
         removes = [RemoveMessage(id=m.id) for m in msgs if getattr(m, "id", None)]
         if removes:
-            await sess.agent.aupdate_state(sess.config(), {"messages": removes})
+            # as_node 必须显式指定：model/tools 都会写 messages，
+            # 否则 LangGraph 抛 "Ambiguous update"，历史其实清不掉。
+            await sess.agent.aupdate_state(sess.config(), {"messages": removes}, as_node="model")
+            logger.info("[session] 会话 %s 已清空对话历史 %d 条", sess.session_id, len(removes))
     except Exception:
-        logger.debug("[session] 清空对话历史异常", exc_info=True)
+        logger.warning("[session] 清空对话历史失败 session=%s", sess.session_id, exc_info=True)
+
+
+_INTERRUPTED_TOOL_NOTICE = (
+    "上一轮该工具调用在返回前被中断，没有拿到结果。"
+    "请基于已知信息继续回答，必要时重新调用该工具。"
+)
+
+
+def _sanitize_tool_call_messages(messages: list) -> tuple[list, int]:
+    """修复“带 tool_calls 却没有对应 ToolMessage 响应”的非法历史。
+
+    OpenAI 兼容接口要求每条 tool_call 都必须有 tool_call_id 匹配的工具结果，
+    否则整个请求 400。请求在工具节点执行期间被超时/中断时，checkpoint 会留下
+    这种悬空消息，因此下一轮对话前必须补齐合成 ToolMessage。
+
+    返回 (修复后的消息列表, 补齐条数)。无问题时原样返回、条数为 0。
+    """
+    sanitized: list = []
+    repairs = 0
+    i, total = 0, len(messages)
+    while i < total:
+        msg = messages[i]
+        sanitized.append(msg)
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if getattr(msg, "type", "") != "ai" or not tool_calls:
+            i += 1
+            continue
+
+        # 收集紧随其后的工具结果，记录已应答的 tool_call_id
+        answered: set[str] = set()
+        j = i + 1
+        while j < total and getattr(messages[j], "type", "") == "tool":
+            answered.add(getattr(messages[j], "tool_call_id", None))
+            sanitized.append(messages[j])
+            j += 1
+
+        for tc in tool_calls:
+            tc_id = tc.get("id")
+            if tc_id and tc_id not in answered:
+                sanitized.append(ToolMessage(
+                    content=_INTERRUPTED_TOOL_NOTICE,
+                    tool_call_id=tc_id,
+                    name=tc.get("name"),
+                    status="error",
+                ))
+                repairs += 1
+        i = j
+    return sanitized, repairs
+
+
+async def _repair_dangling_tool_calls(sess: AgentSession) -> int:
+    """每轮对话前修复悬空的工具调用，避免下一轮请求 400。"""
+    agent = sess.ensure_agent()
+    try:
+        state = await agent.aget_state(sess.config())
+        msgs = state.values.get("messages", [])
+        if not msgs:
+            return 0
+        sanitized, repairs = _sanitize_tool_call_messages(msgs)
+        if not repairs:
+            return 0
+
+        if all(a is b for a, b in zip(sanitized, msgs)) and len(sanitized) >= len(msgs):
+            # 实际中断形态：悬空调用位于历史末尾，直接追加合成结果即可，
+            # 不丢任何历史。as_node 必须显式给出：model/tools 都写 messages，
+            # 否则 LangGraph 报 "Ambiguous update"。
+            update: list = sanitized[len(msgs):]
+        elif all(getattr(m, "id", None) for m in msgs):
+            # 悬空调用夹在中间：需要整段重建才能把结果插到正确位置
+            update = [RemoveMessage(id=m.id) for m in msgs] + sanitized
+        else:
+            # 缺少消息 id 时无法安全重建，退化为仅追加尾部结果
+            update = sanitized[len(msgs):]
+
+        if not update:
+            return 0
+        await agent.aupdate_state(sess.config(), {"messages": update}, as_node="tools")
+        logger.warning(
+            "[memory] session=%s 修复悬空工具调用 %d 个，避免下一轮请求被大模型拒绝",
+            sess.session_id, repairs,
+        )
+        return repairs
+    except Exception:
+        logger.warning("[memory] session=%s 修复悬空工具调用失败", sess.session_id, exc_info=True)
+        return 0
+
+
+async def _prepare_history(sess: AgentSession) -> None:
+    """每轮对话前的历史整理：先修复悬空工具调用，再按窗口裁剪。"""
+    await _repair_dangling_tool_calls(sess)
+    await _trim_history(sess)
 
 
 async def _trim_history(sess: AgentSession) -> None:
@@ -276,7 +370,7 @@ async def _trim_history(sess: AgentSession) -> None:
         return
     removes = [RemoveMessage(id=m.id) for m in msgs[:cut] if getattr(m, "id", None)]
     if removes:
-        await agent.aupdate_state(sess.config(), {"messages": removes})
+        await agent.aupdate_state(sess.config(), {"messages": removes}, as_node="model")
         logger.info("[memory] session=%s 裁剪旧消息 %d 条", sess.session_id, len(removes))
 
 
@@ -816,23 +910,36 @@ async def _reconcile_auth(sess: AgentSession, auth_token: Optional[str]) -> None
 
 # ==================== 对话接口 ====================
 
+def _content_to_text(content) -> str:
+    """把消息 content（字符串或内容块列表）统一转成纯文本。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # 多模态/内容块：只拼接文本块，忽略 tool_use / image 等非文本块
+        parts = []
+        for blk in content:
+            if isinstance(blk, dict):
+                if blk.get("type") in (None, "text"):
+                    parts.append(blk.get("text", ""))
+            elif isinstance(blk, str):
+                parts.append(blk)
+        return "".join(p for p in parts if p)
+    return str(content) if content else ""
+
+
 def _extract_final_text(result: dict) -> str:
     """从 create_agent 返回状态中提取最后一条 AI 消息文本（兼容字符串/内容块）。"""
     messages = result.get("messages", [])
     if not messages:
         return ""
-    last = messages[-1]
-    content = getattr(last, "content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        # 多模态/内容块：拼接其中的文本块
-        parts = [
-            blk.get("text", "") if isinstance(blk, dict) else str(blk)
-            for blk in content
-        ]
-        return "".join(p for p in parts if p)
-    return str(content)
+    return _content_to_text(getattr(messages[-1], "content", ""))
+
+
+def _extract_chunk_text(chunk) -> str:
+    """从流式消息块中提取文本增量；工具结果等无文本块返回空串。"""
+    if getattr(chunk, "type", "") == "tool":
+        return ""
+    return _content_to_text(getattr(chunk, "content", ""))
 
 
 def _friendly_error(trace_id: str, error_msg: str) -> str:
@@ -852,15 +959,43 @@ def _friendly_error(trace_id: str, error_msg: str) -> str:
     return f"小鹿遇到了一点小问题，请您稍后再试试好吗？\n（追踪ID: {trace_id}）"
 
 
-async def chat(session_id: Optional[str], user_input: str, auth_token: Optional[str] = None) -> dict:
-    """处理用户文本对话，返回 session_id/reply/tts_text/is_new_session/trace_id。"""
+NOT_LOGGED_IN_REPLY = (
+    "您还没有登录哦～请先登录后再使用点餐功能。"
+    "您可以在登录页面输入手机号和密码完成登录，小鹿会一直在这里等您～"
+)
+_EMPTY_REPLY_FALLBACK = (
+    "抱歉呀，我刚才没有理解您的意思。能换个说法再告诉我一遍吗？小鹿在认真听呢～"
+)
+
+
+async def stream_chat(
+    session_id: Optional[str],
+    user_input: str,
+    auth_token: Optional[str] = None,
+):
+    """流式处理一轮对话，逐步产出事件字典（异步生成器）。
+
+    事件序列:
+      {"type": "session", "session_id": str, "is_new_session": bool, "trace_id": str}
+      {"type": "delta", "text": str}                       # 0..N 次增量
+      {"type": "done", "session_id", "reply", "tts_text", "is_new_session", "trace_id"}
+      {"type": "error", "message", "session_id", "trace_id"}   # 出错时以 error 收尾
+
+    调用方（SSE 接口）可按 delta 实时渲染；chat() 则消费到 done/error 后聚合成完整回复。
+    """
     trace_id = uuid.uuid4().hex[:12]
     is_new = session_id is None
     sess = None
-    reply = ""
 
     try:
         sess = get_or_create_session(session_id)
+        yield {
+            "type": "session",
+            "session_id": sess.session_id,
+            "is_new_session": is_new,
+            "trace_id": trace_id,
+        }
+
         async with sess.lock():  # 同一会话串行
             sess.last_active = time.time()
             await _reconcile_auth(sess, auth_token)
@@ -871,42 +1006,105 @@ async def chat(session_id: Optional[str], user_input: str, auth_token: Optional[
             )
 
             if not sess.logged_in:
-                return {
+                yield {"type": "delta", "text": NOT_LOGGED_IN_REPLY}
+                yield {
+                    "type": "done",
                     "session_id": sess.session_id,
-                    "reply": "您还没有登录哦～请先登录后再使用点餐功能。您可以在登录页面输入手机号和密码完成登录，小鹿会一直在这里等您～",
+                    "reply": NOT_LOGGED_IN_REPLY,
                     "tts_text": "您还没有登录哦，请先登录后再使用点餐功能。您可以在登录页面输入手机号和密码完成登录，小鹿会一直在这里等您。",
                     "is_new_session": is_new,
                     "trace_id": trace_id,
                 }
+                return
 
             sess.reset_run_counters()
             agent = sess.ensure_agent()
             cfg = sess.config()
-            await _trim_history(sess)
+            await _prepare_history(sess)
 
-            result = await asyncio.wait_for(
-                agent.ainvoke({"messages": [HumanMessage(content=user_input)]}, cfg),
-                timeout=AGENT_TOTAL_TIMEOUT_SECONDS,
-            )
-            reply = _extract_final_text(result)
+            chunks: list[str] = []
+            async with asyncio.timeout(AGENT_TOTAL_TIMEOUT_SECONDS):
+                async for chunk, _meta in agent.astream(
+                    {"messages": [HumanMessage(content=user_input)]},
+                    cfg,
+                    stream_mode="messages",
+                ):
+                    text = _extract_chunk_text(chunk)
+                    if not text:
+                        continue
+                    chunks.append(text)
+                    yield {"type": "delta", "text": text}
+
+            reply = "".join(chunks)
             if not reply or not reply.strip():
-                reply = "抱歉呀，我刚才没有理解您的意思。能换个说法再告诉我一遍吗？小鹿在认真听呢～"
+                reply = _EMPTY_REPLY_FALLBACK
+                yield {"type": "delta", "text": reply}
             mark_llm_success()
+            yield {
+                "type": "done",
+                "session_id": sess.session_id,
+                "reply": reply,
+                "tts_text": clean_text_for_tts(reply),
+                "is_new_session": is_new,
+                "trace_id": trace_id,
+            }
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         mark_llm_failure()
         logger.error("[chat] trace=%s 总耗时超过 %.0fs", trace_id, AGENT_TOTAL_TIMEOUT_SECONDS)
-        reply = f"这一轮处理时间过长已被中断，请简化需求或稍后再试～\n（追踪ID: {trace_id}）"
+        yield {
+            "type": "error",
+            "message": f"这一轮处理时间过长已被中断，请简化需求或稍后再试～\n（追踪ID: {trace_id}）",
+            "session_id": sess.session_id if sess else (session_id or ""),
+            "trace_id": trace_id,
+        }
     except Exception as e:
         mark_llm_failure()
         logger.error(
             "[chat] trace=%s session=%s ERROR type=%s msg=%s\n%s",
             trace_id, session_id or "(new)", type(e).__name__, str(e), traceback.format_exc(),
         )
-        reply = _friendly_error(trace_id, str(e))
+        yield {
+            "type": "error",
+            "message": _friendly_error(trace_id, str(e)),
+            "session_id": sess.session_id if sess else (session_id or ""),
+            "trace_id": trace_id,
+        }
 
-    tts_text = clean_text_for_tts(reply)
-    result_session_id = sess.session_id if sess else (session_id or "")
+
+async def chat(session_id: Optional[str], user_input: str, auth_token: Optional[str] = None) -> dict:
+    """处理用户文本对话，返回 session_id/reply/tts_text/is_new_session/trace_id。
+
+    内部统一走 stream_chat 的流式链路再聚合，使 /agent/text 与
+    /agent/text/stream 行为一致；对外返回值与旧实现完全兼容。
+    """
+    result_session_id = session_id or ""
+    reply = ""
+    tts_text = ""
+    is_new = session_id is None
+    trace_id = ""
+
+    async for ev in stream_chat(session_id, user_input, auth_token):
+        etype = ev.get("type")
+        if etype == "session":
+            result_session_id = ev["session_id"]
+            trace_id = ev["trace_id"]
+        elif etype == "done":
+            result_session_id = ev["session_id"]
+            reply = ev["reply"]
+            tts_text = ev.get("tts_text", reply)
+            is_new = ev["is_new_session"]
+            trace_id = ev["trace_id"]
+        elif etype == "error":
+            result_session_id = ev.get("session_id", result_session_id)
+            reply = ev["message"]
+            tts_text = clean_text_for_tts(reply)
+            trace_id = ev.get("trace_id", trace_id)
+
+    if not reply:
+        reply = _EMPTY_REPLY_FALLBACK
+    if not tts_text:
+        tts_text = clean_text_for_tts(reply)
     return {
         "session_id": result_session_id,
         "reply": reply,

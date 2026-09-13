@@ -54,7 +54,9 @@ def get_llm() -> ChatOpenAI:
             max_tokens=MAX_LLM_TOKENS,
             api_key=DEEPSEEK_API_KEY,
             base_url=DEEPSEEK_BASE_URL,
-            streaming=False,
+            # 流式输出：Agent 的 astream 按 token 增量返回，首字延迟更低。
+            # 非流式的 ainvoke/健康探测仍可正常工作（内部聚合完整结果）。
+            streaming=True,
             request_timeout=LLM_REQUEST_TIMEOUT,
             http_client=http_client,
             http_async_client=async_http_client,
