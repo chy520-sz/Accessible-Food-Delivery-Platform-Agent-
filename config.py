@@ -151,6 +151,12 @@ MILVUS_DB_NAME = os.getenv("MILVUS_DB_NAME", "default")
 RAG_INDEX_TYPE = os.getenv("RAG_INDEX_TYPE", "FLAT")
 RAG_METRIC_TYPE = os.getenv("RAG_METRIC_TYPE", "COSINE")
 
+# 单次 Milvus RPC（加载集合/检索）超时（秒）。没有超时时集合一旦卡在 Loading，
+# 同步调用会无限阻塞并拖满整轮对话预算，因此必须显式限时。
+RAG_CALL_TIMEOUT = float(os.getenv("RAG_CALL_TIMEOUT", "10"))
+# 检索失败后的快速失败冷却时间（秒）：期间不再尝试 Milvus，避免每个请求都卡满超时。
+RAG_FAILURE_COOLDOWN = float(os.getenv("RAG_FAILURE_COOLDOWN", "30"))
+
 # 每次检索返回条数（起点）
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
 # COSINE 相似度下限（越大越相似）；低于该值视为无关，允许返回“未找到”。
