@@ -8,8 +8,9 @@
 - FastAPI + Uvicorn
 - LangChain 1.2 + LangGraph
 - DeepSeek Chat
-- Milvus + `pymilvus`
-- `qwen3.7-text-embedding-flash`，1024 维
+- Milvus 2.6.0 + `pymilvus`（稠密向量 + BM25 稀疏向量双路混合检索）
+- `qwen3.7-text-embedding-flash`，1024 维（语义嵌入）
+- `gte-rerank-v2` Cross-Encoder（精排重排序）
 - 阿里云智能语音 ASR
 - Edge TTS
 
@@ -26,14 +27,20 @@ take-out Agent/
 │  ├─ deps.py                 # 限流器与服务密钥鉴权依赖
 │  └─ schemas.py              # 请求/响应 Pydantic 模型
 ├─ agent.py                   # Agent、工具、会话管理与流式对话
+├─ tools.py                   # 35 个工具函数（菜品/套餐/分类/商家/订单/评分/RAG等）
+├─ prompts.py                 # Agent 系统提示词与能力清单
 ├─ llm_client.py              # 共享 LLM 单例（streaming=True）
-├─ config.py                  # 环境变量
-├─ knowledge_base.py          # Milvus 检索
-├─ embedding_client.py        # Qwen Embedding 客户端
-├─ build_knowledge_base.py    # 知识库构建
-├─ check_rag.py               # RAG 自检
+├─ config.py                  # 环境变量（含 RAG 全链路配置）
+├─ knowledge_base.py          # Milvus 检索核心（混合检索+RRF+Rerank+元数据过滤+Query改写）
+├─ embedding_client.py        # Qwen Embedding 客户端（带 SQLite 磁盘缓存）
+├─ rerank_client.py           # 百炼 gte-rerank-v2 Cross-Encoder 精排客户端
+├─ query_rewriter.py          # Query 改写（多 Query 扩展 / HyDE 假设文档嵌入）
+├─ build_knowledge_base.py    # 知识库构建（稠密+BM25稀疏双路集合）
+├─ sync_dish_knowledge.py     # 从 Java 后端同步菜品到知识库 JSON
+├─ fill_dish_fields.py        # 菜品知识库字段补全（口味/食材/营养/辣度等）
+├─ check_rag.py               # RAG 自检（嵌入/Milvus/集合/检索/阈值过滤）
 ├─ speech.py                  # ASR 与 TTS
-├─ data/                      # JSON 知识源（dish/dietary/faq）
+├─ data/                      # JSON 知识源（dish 1146条 / dietary 18条 / faq 20条）
 ├─ tests/                     # 单元测试
 └─ docker-compose.milvus.yml  # Milvus Standalone v2.6.0（三容器）
 ```
@@ -113,6 +120,33 @@ docker compose -f docker-compose.milvus.yml ps
 
 ## 构建 RAG 知识库
 
+知识库由三个 JSON 源构建，当前规模：
+
+| 类型 | 知识源 | 记录数 | 集合 |
+|---|---|---|---|
+| 菜品 | `data/dish_knowledge.json` | 1146 | `takeout_dish_qwen37_1024_v1` |
+| 饮食健康 | `data/dietary_knowledge.json` | 18 | `takeout_dietary_qwen37_1024_v1` |
+| 常见问题 | `data/faq_knowledge.json` | 20 | `takeout_faq_qwen37_1024_v1` |
+
+每个集合同时存储**稠密向量**（语义检索）和 **BM25 稀疏向量**（关键词检索），由 Milvus BM25 Function 从 `text` 字段自动生成。
+
+### 从后端同步菜品知识
+
+菜品知识库与 Java 后端数据库是两套独立数据。后端菜品变更后，同步到知识库：
+
+```powershell
+# 1. 从后端拉取实时菜品，追加到 dish_knowledge.json（需后端运行 + 测试账号）
+D:\anaconda3\envs\take-out\python.exe sync_dish_knowledge.py --phone 13900000000 --password 123456 --write
+
+# 2. 补全新增菜品的口味/食材/营养/辣度等字段
+D:\anaconda3\envs\take-out\python.exe fill_dish_fields.py
+
+# 3. 重建 Milvus 向量库
+D:\anaconda3\envs\take-out\python.exe build_knowledge_base.py
+```
+
+### 构建命令
+
 首次运行或知识源发生变化时执行：
 
 ```powershell
@@ -134,11 +168,77 @@ D:\anaconda3\envs\take-out\python.exe build_knowledge_base.py --only dietary
 D:\anaconda3\envs\take-out\python.exe build_knowledge_base.py --only faq
 ```
 
-| 类型 | 默认集合 |
+构建流水线：校验 JSON → 清洗拼接文本 → 分块（≤300字，overlap50）→ 批量 Embedding（带 SQLite 缓存）→ 写入 Milvus（稠密+BM25稀疏+元数据）→ 数量/维度/检索冒烟校验。
+
+## RAG 检索链路
+
+在线检索采用**混合检索 + Rerank 精排**的完整链路，兼顾语义召回和关键词精确匹配：
+
+```
+用户 Query
+  │
+  ├─ ① Query 改写（可选，默认关闭）
+  │    ├─ multi_query：LLM 扩展为 N 个语义等价查询，分别稠密检索后合并去重
+  │    └─ hyde：LLM 生成假设答案文档，用文档 embedding 替代 query embedding
+  │
+  ├─ ② 元数据预过滤（可选，默认开启）
+  │    Milvus 标量过滤：category / shop / spicy_level / taste / price 等
+  │
+  ├─ ③ 双路召回（recall_k=20，粗排多召回）
+  │    ├─ 稠密路：Query → qwen Embedding(1024维) → Milvus COSINE 检索
+  │    └─ BM25路：原始 Query → 中文分词 → 稀疏向量倒排检索
+  │
+  ├─ ④ RRF 融合（k=60，只依赖排名，融合 COSINE 与 BM25 两种量纲）
+  ├─ ⑤ Rerank 精排（gte-rerank-v2 Cross-Encoder，query-document 联合编码打分）
+  ├─ ⑥ 阈值过滤（rerank ≥ 0.05）→ 截取最终 top_k（默认 8）
+  │
+  └─ ⑦ 格式化 Context（带来源标记【菜名】[分类]和相关性分数）
+       → LangChain ToolMessage 注入 → DeepSeek LLM 生成 → 带来源的答案
+```
+
+### 三级降级策略
+
+| 故障点 | 降级行为 |
 |---|---|
-| 菜品 | `takeout_dish_qwen37_1024_v1` |
-| 饮食健康 | `takeout_dietary_qwen37_1024_v1` |
-| 常见问题 | `takeout_faq_qwen37_1024_v1` |
+| BM25 路异常 | 降级为纯稠密检索 |
+| Rerank API 异常 | 降级为 RRF 粗排（稠密阈值 + BM25 补充通道） |
+| Milvus 异常 | 熔断器快速失败，工具层返回"知识库不可用"，绝不伪装成"没找到" |
+| Query 改写异常 | 降级为原始 Query 检索 |
+
+### 元数据过滤用法
+
+调用 `search_knowledge()` 时传入 `filters` 参数，在 Milvus 检索阶段预过滤：
+
+```python
+from knowledge_base import search_knowledge
+
+# 等值过滤
+search_knowledge("鸡肉", collection, filters={"category": "川菜"})
+
+# 组合过滤：分类 IN + 辣度 >= 2
+search_knowledge("辣", collection, filters={
+    "category__in": ["川菜", "湘菜"],
+    "spicy_level__gte": 2,
+})
+
+# 店铺 + 价格上限
+search_knowledge("套餐", collection, filters={
+    "shop": "湘味人家",
+    "price__lte": 50,
+})
+```
+
+支持的操作符：`__eq`(默认) / `__ne` / `__in` / `__nin` / `__contains` / `__gt` / `__gte` / `__lt` / `__lte`。
+
+### RAG 工具（Agent 层）
+
+LLM 通过三个 `@tool` 自主调用知识库：
+
+| 工具 | 用途 | 集合 |
+|---|---|---|
+| `search_food_knowledge(query)` | 菜品口味、烹饪方法、食材搭配、菜系文化 | dish |
+| `search_dietary_knowledge(query)` | 疾病饮食限制、营养建议、食物禁忌、过敏原 | dietary |
+| `search_faq(query)` | 点餐流程、订单修改、配送时间、支付方式 | faq |
 
 ## 启动 Agent
 
@@ -204,23 +304,34 @@ data: {"message":"服务繁忙，请稍后再试","trace_id":"a1b2c3d4"}
 
 ## RAG 日志
 
-菜品搜索固定执行 Milvus RAG 与实时检索。同一次调用使用相同 ID 串联日志：
+菜品搜索固定执行 Milvus RAG 与实时检索。同一次调用使用相同 8 位 ID 串联日志，完整链路示例：
 
 ```text
-[RAG tool][b8fc73cf] type=dish query='牛肉'
-[RAG][b8fc73cf] START
-[RAG][b8fc73cf] EMBEDDING_DONE dim=1024 elapsed_ms=1038
-[RAG][b8fc73cf] MILVUS_DONE candidates=8 elapsed_ms=334
-[RAG][b8fc73cf] FILTER candidates=8 accepted=8 scores=[...]
-[RAG][b8fc73cf] FINISH elapsed_ms=1486
+[RAG tool][73ac0dd6] type=dish query='鸡肉'
+[RAG][73ac0dd6] START type=dish final_top_k=8 recall_k=20 hybrid=True rerank=True
+[RAG][73ac0dd6] EMBEDDING_DONE dim=1024 elapsed_ms=1201
+[RAG][73ac0dd6] DENSE_DONE candidates=8 elapsed_ms=924          # 稠密语义检索
+[RAG][73ac0dd6] BM25_DONE candidates=1 elapsed_ms=82             # BM25 关键词检索
+[RAG][73ac0dd6] FUSE mode=HYBRID rrf_k=60 dense=8 bm25=1 fused=8   # RRF 融合
+[RAG][73ac0dd6] DENSE_DIST candidates=8 max=0.590 min=0.564 avg=0.574 | ≥0.60=0 0.40-0.60=8 ...
+[RAG][73ac0dd6] DENSE_TOP_K   D#1 ✓ cosine=0.590 【鸡块(5块)】[热销推荐] ...
+[RAG][73ac0dd6] BM25_TOP_K    B#1 🔑 bm25=8.462 【辣子鸡】[川菜] ...
+[RAG][73ac0dd6] FUSED_RANK    F#1 rrf=0.01639 [D#1 B#-] ...
+[RAG][73ac0dd6] RERANK_DONE model=gte-rerank-v2 pre_candidates=8 elapsed_ms=318
+[RAG][73ac0dd6] RERANK_DIST candidates=8 max=0.189 min=0.027 | ≥0.50=0 0.15-0.50=2 ...
+[RAG][73ac0dd6] RERANK_DETAIL R#1 ✓ rerank=0.189 (RRF#1→#1) 【辣子鸡】[川菜] ...
+[RAG][73ac0dd6] FILTER mode=RERANK reranked=8 accepted=5 rejected=3 threshold=0.050
+[RAG][73ac0dd6] FINISH mode=RERANK accepted=5 elapsed_ms=2285
 ```
+
+关键日志阶段：`METADATA_FILTER`（标量过滤）→ `QUERY_REWRITE`（Query改写）→ `EMBEDDING_DONE` → `DENSE_DONE`/`BM25_DONE`（双路召回）→ `FUSE`（RRF融合）→ `DENSE_DIST`/`BM25_DIST`（分数分布）→ `RERANK_DONE`/`RERANK_DIST`（精排）→ `FILTER`（阈值过滤）→ `FINISH`。
 
 日志不会输出 API Key 或向量原值。
 
 ## RAG 可用性保障
 
 Milvus 异常（如集合卡在 `Loading`）时，同步调用若无超时会无限阻塞，并拖满整轮对话预算。
-检索链路对此做了两层保护，可在 `.env` 中调整：
+检索链路对此做了多层保护，可在 `.env` 中调整：
 
 ```env
 RAG_CALL_TIMEOUT=10       # 单次 Milvus RPC（加载集合/检索）超时（秒）
@@ -228,9 +339,74 @@ RAG_FAILURE_COOLDOWN=30   # 检索失败后的快速失败冷却时间（秒）
 ```
 
 - **调用限时**：`load_collection` / `search` / `has_collection` 等均带显式超时；超时抛
-  `KnowledgeStoreError`，工具层快速返回“知识库不可用”，不再阻塞整轮。
+  `KnowledgeStoreError`，工具层快速返回"知识库不可用"，不再阻塞整轮。
 - **失败熔断**：某集合检索失败后进入冷却期，期间直接快速失败，避免每个请求都重复撞超时；
-  冷却结束自动给一次恢复机会。“集合尚未构建”不算故障，不进入冷却，构建后即可立即恢复。
+  冷却结束自动给一次恢复机会。"集合尚未构建"不算故障，不进入冷却，构建后即可立即恢复。
+- **三级降级**：BM25 路故障 → 纯稠密；Rerank API 故障 → RRF 粗排；Query 改写故障 → 原始 Query。
+  任何单路故障不影响整体检索可用性。
+- **Embedding 缓存**：SQLite 磁盘缓存按 `模型|维度|版本|text_type|文本哈希` 去重，
+  重建知识库时未变化的文本不重复计费。
+
+## RAG 配置参考
+
+所有 RAG 相关配置均在 `config.py` 中管理，可通过环境变量覆盖：
+
+### 基础检索
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `RAG_TOP_K` | `8` | 最终返回条数 |
+| `RAG_MIN_SCORE` | `0.25` | 稠密 COSINE 相似度下限（粗排阈值） |
+| `RAG_METRIC_TYPE` | `COSINE` | 稠密向量度量类型 |
+| `RAG_CALL_TIMEOUT` | `10` | 单次 Milvus RPC 超时（秒） |
+| `RAG_FAILURE_COOLDOWN` | `30` | 检索失败冷却时间（秒） |
+
+### 混合检索（稠密 + BM25）
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `RAG_HYBRID_SEARCH_ENABLED` | `true` | 混合检索总开关（集合需具备 sparse_vector 字段） |
+| `RAG_HYBRID_RRF_K` | `60` | RRF 融合参数 k（越大排名差异越平） |
+| `RAG_BM25_TOP_K` | `8` | BM25 路召回条数 |
+| `RAG_BM25_DROP_RATIO` | `0.2` | BM25 忽略低 IDF term 比例 |
+| `RAG_BM25_RESCUE_RANK` | `3` | BM25 精确命中补充通道排名阈值 |
+| `RAG_SPARSE_FIELD` | `sparse_vector` | BM25 稀疏向量字段名 |
+
+### Rerank 精排
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `RAG_RERANK_ENABLED` | `true` | Rerank 总开关 |
+| `RAG_RERANK_MODEL` | `gte-rerank-v2` | 百炼 Cross-Encoder 模型 |
+| `RAG_RERANK_CANDIDATES` | `20` | 精排候选数（召回阶段扩大到此值） |
+| `RAG_RERANK_BATCH_SIZE` | `32` | 单次 rerank 请求最大文档数 |
+| `RAG_RERANK_MIN_SCORE` | `0.05` | rerank 相关性分数下限（精排阈值） |
+| `RAG_RERANK_TIMEOUT` | `15` | Rerank API 超时（秒） |
+
+### Query 改写（默认关闭）
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `RAG_QUERY_REWRITE_ENABLED` | `false` | Query 改写总开关（启用会增加 LLM 调用延迟） |
+| `RAG_QUERY_REWRITE_MODE` | `multi_query` | 改写模式：`multi_query` / `hyde` |
+| `RAG_QUERY_REWRITE_NUM` | `3` | 多 Query 扩展数量 |
+| `RAG_QUERY_REWRITE_TIMEOUT` | `10` | Query 改写 LLM 调用超时（秒） |
+
+### 元数据过滤
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `RAG_METADATA_FILTER_ENABLED` | `true` | 元数据过滤总开关（`search_knowledge(filters=...)` 生效） |
+
+### Embedding
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `RAG_EMBEDDING_MODEL` | `qwen3.7-text-embedding-flash` | 嵌入模型 |
+| `RAG_EMBEDDING_DIMENSIONS` | `1024` | 向量维度 |
+| `RAG_EMBEDDING_BATCH_SIZE` | `25` | 批量嵌入大小 |
+| `RAG_EMBEDDING_TIMEOUT` | `30` | Embedding API 超时（秒） |
+| `RAG_EMBEDDING_CACHE_DIR` | `./data/embedding_cache` | SQLite 缓存目录 |
 
 ## 会话历史自愈
 

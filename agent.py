@@ -65,16 +65,22 @@ from tools import (
     login as _login,
     search_dishes as _search_dishes,
     get_dish_detail as _get_dish_detail,
+    search_combos as _search_combos,
+    get_combo_detail as _get_combo_detail,
     recommend_dishes as _recommend_dishes,
     rate_item as _rate_item,
     get_my_rating_history as _get_my_rating_history,
     get_cart as _get_cart,
     add_to_cart as _add_to_cart,
+    add_combo_to_cart as _add_combo_to_cart,
     clear_cart as _clear_cart,
     get_user_orders as _get_user_orders,
     get_user_addresses as _get_user_addresses,
     place_order as _place_order,
     get_shop_status as _get_shop_status,
+    list_categories as _list_categories,
+    list_shops as _list_shops,
+    search_dishes_by_shop as _search_dishes_by_shop,
     estimate_dish_nutrition as _estimate_dish_nutrition,
     agent_accept_order as _agent_accept_order,
     agent_start_delivery as _agent_start_delivery,
@@ -430,6 +436,22 @@ def _create_tools(sess: AgentSession):
         return _get_dish_detail(session_id, dish_id)
 
     @tool
+    def search_combos(keyword: str = "", category_id: Optional[int] = None) -> str:
+        """搜索套餐。可以按套餐名称关键词（如"双人餐""家庭餐""单人餐"）或分类ID查找套餐。
+        返回套餐名称、所属店铺、价格、月销量等信息。
+        参数 keyword: 搜索关键词，可为空
+        参数 category_id: 分类ID数字，可为空
+        """
+        return _search_combos(session_id, keyword, category_id)
+
+    @tool
+    def get_combo_detail(combo_id: int) -> str:
+        """查看某个套餐的详细信息，包括价格、描述、库存，以及套餐包含的所有菜品明细。
+        参数 combo_id: 套餐ID数字
+        """
+        return _get_combo_detail(session_id, combo_id)
+
+    @tool
     def recommend_dishes(limit: int = 5) -> str:
         """根据用户历史评分偏好、菜品平均评分、评分数量、时间衰减和销量推荐菜品。
         参数 limit: 推荐数量，默认5
@@ -463,6 +485,16 @@ def _create_tools(sess: AgentSession):
         参数 quantity: 数量，默认1
         """
         result = _add_to_cart(session_id, dish_id, quantity)
+        sess.order_gate.clear()  # 购物车变化后旧的待确认订单失效
+        return result
+
+    @tool
+    def add_combo_to_cart(combo_id: int, quantity: int = 1) -> str:
+        """把套餐加入购物车。套餐是多道菜的组合优惠，价格比单独点更划算。
+        参数 combo_id: 套餐ID数字
+        参数 quantity: 数量，默认1
+        """
+        result = _add_combo_to_cart(session_id, combo_id, quantity)
         sess.order_gate.clear()  # 购物车变化后旧的待确认订单失效
         return result
 
@@ -510,6 +542,32 @@ def _create_tools(sess: AgentSession):
     def get_shop_status() -> str:
         """查询店铺当前的营业状态（是否在营业中）。无需登录即可查询。"""
         return _get_shop_status()
+
+    @tool
+    def list_categories() -> str:
+        """获取所有菜品分类列表，用于分类浏览导航。展示分类名称和分类ID，
+        用户想按分类筛选菜品时先调用此工具获取分类ID，再用 search_dishes 按 category_id 筛选。
+        无需登录即可查询。"""
+        return _list_categories()
+
+    @tool
+    def list_shops() -> str:
+        """获取所有已启用的商家列表，用于商家浏览。展示商家名称、ID、评分、评论数，
+        用户想查看某家店的菜品时先调用此工具获取商家ID，再用 search_dishes_by_shop 查看该店菜品。
+        无需登录即可查询。"""
+        return _list_shops()
+
+    @tool
+    def search_dishes_by_shop(shop_id: int, keyword: str = "", page: int = 1, page_size: int = 20) -> str:
+        """按商家ID搜索该店铺的所有菜品，可叠加关键词筛选。返回菜品名称、价格、库存、菜品ID。
+        用户说"看看XX店有什么菜""这家店的招牌菜"时使用。先通过 list_shops 获取 shop_id。
+        无需登录即可查询。
+        参数 shop_id: 商家ID数字（先通过 list_shops 获取）
+        参数 keyword: 搜索关键词（可选）
+        参数 page: 页码，从1开始（默认1）
+        参数 page_size: 每页条数（默认20）
+        """
+        return _search_dishes_by_shop(shop_id, keyword, page, page_size)
 
     @tool
     def estimate_dish_nutrition(dish_name: str, dish_desc: str = "") -> str:
@@ -733,9 +791,11 @@ def _create_tools(sess: AgentSession):
         return _get_diet_plan_history(session_id, limit)
 
     return [
-        login, search_dishes, get_dish_detail, recommend_dishes, rate_item,
-        get_my_rating_history, get_cart, add_to_cart, clear_cart,
+        login, search_dishes, get_dish_detail, search_combos, get_combo_detail,
+        recommend_dishes, rate_item,
+        get_my_rating_history, get_cart, add_to_cart, add_combo_to_cart, clear_cart,
         get_user_orders, get_user_addresses, place_order, get_shop_status,
+        list_categories, list_shops, search_dishes_by_shop,
         estimate_dish_nutrition, simulate_multi_agent, merchant_accept_order,
         delivery_pickup_order, delivery_complete_order, query_order_status,
         search_food_knowledge, search_dietary_knowledge, search_faq,

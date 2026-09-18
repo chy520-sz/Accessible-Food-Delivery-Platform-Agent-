@@ -162,6 +162,52 @@ RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
 # COSINE 相似度下限（越大越相似）；低于该值视为无关，允许返回“未找到”。
 # 该阈值需用项目评测问题校准，这里仅给保守默认值。
 RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.25"))
+
+# ---------- 混合检索（稠密向量 + BM25 全文检索 + RRF 融合）----------
+# 总开关：集合具备 sparse_vector 字段时自动启用双路混合检索，否则降级纯稠密
+RAG_HYBRID_SEARCH_ENABLED = os.getenv("RAG_HYBRID_SEARCH_ENABLED", "true").lower() == "true"
+# RRF（Reciprocal Rank Fusion）融合参数 k：k 越大，排名差异被拉得越平，常用 60
+RAG_HYBRID_RRF_K = int(os.getenv("RAG_HYBRID_RRF_K", "60"))
+# BM25 路每路召回条数（通常与稠密路一致）
+RAG_BM25_TOP_K = int(os.getenv("RAG_BM25_TOP_K", str(RAG_TOP_K)))
+# BM25 检索时忽略低 IDF term 的比例（0~1），降低停用词噪声
+RAG_BM25_DROP_RATIO = float(os.getenv("RAG_BM25_DROP_RATIO", "0.2"))
+# BM25 精确命中“补充通道”：稠密分数不足阈值，但 BM25 排名进入前 N 时仍保留
+# （解决“直接搜菜名”时稠密语义漂移、关键词精确匹配被误杀的问题）
+RAG_BM25_RESCUE_RANK = int(os.getenv("RAG_BM25_RESCUE_RANK", "3"))
+# BM25 稀疏向量字段名
+RAG_SPARSE_FIELD = os.getenv("RAG_SPARSE_FIELD", "sparse_vector")
+
+# ---------- Rerank 精排（Cross-Encoder 对 query-document 对精细打分）----------
+# 总开关：启用后召回阶段扩大候选数，经 RRF 融合后用 rerank 模型重新精排
+RAG_RERANK_ENABLED = os.getenv("RAG_RERANK_ENABLED", "true").lower() == "true"
+# 百炼 gte-rerank-v2：中英文 Cross-Encoder，输出 0~1 相关性分数
+RAG_RERANK_MODEL = os.getenv("RAG_RERANK_MODEL", "gte-rerank-v2")
+RAG_RERANK_TIMEOUT = float(os.getenv("RAG_RERANK_TIMEOUT", "15"))
+# 精排候选数：召回阶段（稠密+BM25）各取这么多条，融合后交给 rerank
+# 标准做法是“粗排多召回、精排少而准”，通常取最终 top_k 的 2~4 倍
+RAG_RERANK_CANDIDATES = int(os.getenv("RAG_RERANK_CANDIDATES", "20"))
+# 单次 rerank 请求最大文档数（百炼 rerank 接口上限较高，保守取 32）
+RAG_RERANK_BATCH_SIZE = int(os.getenv("RAG_RERANK_BATCH_SIZE", "32"))
+# rerank 相关性分数下限（gte-rerank 输出 0~1；实测相关菜品多在 0.1 以上，
+# 完全不相关在 0.01 以下，0.05 是较保守的过滤线，需用评测集校准）
+RAG_RERANK_MIN_SCORE = float(os.getenv("RAG_RERANK_MIN_SCORE", "0.05"))
+
+# ---------- Query 改写（提升召回率：多 Query 扩展 / HyDE 假设文档嵌入）----------
+# 总开关：启用后在检索前用 LLM 改写 Query，提升模糊/口语化查询的召回率
+RAG_QUERY_REWRITE_ENABLED = os.getenv("RAG_QUERY_REWRITE_ENABLED", "false").lower() == "true"
+# 改写模式：multi_query（生成 N 个语义等价查询，分别检索后合并）
+#          hyde（生成假设答案文档，用文档 embedding 替代 query embedding 检索）
+RAG_QUERY_REWRITE_MODE = os.getenv("RAG_QUERY_REWRITE_MODE", "multi_query")
+# 多 Query 扩展数量（含原始 Query 共检索 N+1 路，合并去重后融合）
+RAG_QUERY_REWRITE_NUM = int(os.getenv("RAG_QUERY_REWRITE_NUM", "3"))
+# Query 改写 LLM 调用超时（秒）；超时则降级用原始 Query 检索
+RAG_QUERY_REWRITE_TIMEOUT = float(os.getenv("RAG_QUERY_REWRITE_TIMEOUT", "10"))
+
+# ---------- 元数据过滤（Milvus 标量过滤：检索时按 category/tags/shop 预过滤）----------
+# 总开关：启用后 search_knowledge 支持 filters 参数，在 Milvus 检索阶段预过滤
+RAG_METADATA_FILTER_ENABLED = os.getenv("RAG_METADATA_FILTER_ENABLED", "true").lower() == "true"
+
 # 知识库集合名称（新版本集合，维度/模型体现在名字里）
 RAG_COLLECTION_FOOD = os.getenv("RAG_COLLECTION_FOOD", "takeout_dish_qwen37_1024_v1")
 RAG_COLLECTION_DIETARY = os.getenv("RAG_COLLECTION_DIETARY", "takeout_dietary_qwen37_1024_v1")

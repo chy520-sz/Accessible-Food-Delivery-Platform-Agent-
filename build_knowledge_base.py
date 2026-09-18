@@ -33,6 +33,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config import (
+    RAG_BM25_DROP_RATIO,
     RAG_CONTENT_VERSION,
     RAG_COLLECTION_DIETARY,
     RAG_COLLECTION_FAQ,
@@ -41,6 +42,7 @@ from config import (
     RAG_EMBEDDING_MODEL,
     RAG_INDEX_TYPE,
     RAG_METRIC_TYPE,
+    RAG_SPARSE_FIELD,
 )
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -114,7 +116,18 @@ def _dish_entry(item: dict) -> tuple[str, str, dict]:
         f"标签：{tags}\n过敏原：{allergens}"
     )
     business_id = str(item.get("dish_id") or f"{name}|{item.get('shop', '')}")
-    meta = {"name": name, "category": category, "tags": tags}
+    # 写入 Milvus 的元数据：用于标量过滤（category/shop/spicy_level/taste 等）
+    # 注意：spicy_level 保持 int 类型，便于数值范围过滤；tags 保持字符串便于 like 模糊匹配
+    meta = {
+        "name": name,
+        "category": category,
+        "tags": tags,
+        "shop": item.get("shop", ""),
+        "taste": item.get("taste", ""),
+        "cooking_method": item.get("cooking_method", ""),
+        "spicy_level": item.get("spicy_level") if item.get("spicy_level") is not None else -1,
+        "price": float(item.get("price", 0)) if item.get("price") else 0.0,
+    }
     return text, business_id, meta
 
 
@@ -215,8 +228,8 @@ def build_documents(spec: BuildSpec) -> list[Document]:
 # ==================== 写入 Milvus ====================
 
 def _create_store(collection: str):
-    """使用官方 MilvusClient 创建一个全新的集合。"""
-    from pymilvus import DataType
+    """使用官方 MilvusClient 创建一个全新的集合（稠密向量 + BM25 稀疏向量双路）。"""
+    from pymilvus import DataType, Function, FunctionType
     from knowledge_base import get_milvus_client, reset_store_cache
 
     client = get_milvus_client()
@@ -227,14 +240,39 @@ def _create_store(collection: str):
 
     schema = client.create_schema(auto_id=False, enable_dynamic_field=True)
     schema.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=128)
-    schema.add_field("text", DataType.VARCHAR, max_length=65535)
+    # text 字段启用中文分析器，作为 BM25 Function 的输入
+    schema.add_field(
+        "text",
+        DataType.VARCHAR,
+        max_length=65535,
+        enable_analyzer=True,
+        analyzer_params={"type": "chinese"},
+    )
     schema.add_field("vector", DataType.FLOAT_VECTOR, dim=RAG_EMBEDDING_DIMENSIONS)
+    # BM25 稀疏向量字段：由 BM25 Function 从 text 自动生成，写入时无需手动提供
+    schema.add_field(RAG_SPARSE_FIELD, DataType.SPARSE_FLOAT_VECTOR)
+    # 注册 BM25 Function：text -> sparse_vector
+    schema.add_function(Function(
+        name="bm25_fn",
+        input_field_names=["text"],
+        output_field_names=[RAG_SPARSE_FIELD],
+        function_type=FunctionType.BM25,
+    ))
+
     index_params = client.prepare_index_params()
+    # 稠密向量索引（语义检索）
     index_params.add_index(
         field_name="vector",
         index_type=RAG_INDEX_TYPE,
         metric_type=RAG_METRIC_TYPE,
         params={},
+    )
+    # 稀疏向量倒排索引（BM25 关键词检索）
+    index_params.add_index(
+        field_name=RAG_SPARSE_FIELD,
+        index_type="SPARSE_INVERTED_INDEX",
+        metric_type="BM25",
+        params={"drop_ratio_build": RAG_BM25_DROP_RATIO},
     )
     client.create_collection(
         collection_name=collection,
