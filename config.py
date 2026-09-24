@@ -77,10 +77,22 @@ AGENT_TOTAL_TIMEOUT_SECONDS = float(os.getenv("AGENT_TOTAL_TIMEOUT_SECONDS", "11
 # 长对话消息窗口：checkpoint 中最多保留的最近消息条数（工具调用/结果成对裁剪）
 AGENT_MESSAGE_WINDOW = int(os.getenv("AGENT_MESSAGE_WINDOW", "24"))
 
+# ==================== Agent 评测轨迹（只记录结构化元数据） ====================
+EVAL_TRACE_ENABLED = os.getenv("EVAL_TRACE_ENABLED", "true").lower() in ("1", "true", "yes")
+EVAL_TRACE_PATH = os.getenv("EVAL_TRACE_PATH", "./data/agent_traces.jsonl")
+
 # ==================== 会话管理 ====================
 SESSION_EXPIRE_SECONDS = int(os.getenv("SESSION_EXPIRE_SECONDS", "1800"))
 MAX_LLM_TOKENS = int(os.getenv("MAX_LLM_TOKENS", "2000"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+
+# ==================== 分层长期记忆 ====================
+# 长期记忆与 LangGraph 会话历史分开持久化；外部知识引用进入独立 RAG 审核收件箱。
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() in ("1", "true", "yes")
+MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./data/agent_memory.db")
+MEMORY_RAG_INBOX_PATH = os.getenv("MEMORY_RAG_INBOX_PATH", "./data/rag_reference_inbox.jsonl")
+MEMORY_RETRIEVAL_TOP_K = int(os.getenv("MEMORY_RETRIEVAL_TOP_K", "6"))
+MEMORY_STALE_DAYS = int(os.getenv("MEMORY_STALE_DAYS", "180"))
 
 # ==================== Agent API Key ====================
 # 用于 Agent 调用 Java 后端专用接口（如模拟商家接单/配送），请设置为复杂随机字符串

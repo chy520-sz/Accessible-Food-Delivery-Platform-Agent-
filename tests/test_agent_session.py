@@ -65,6 +65,15 @@ def test_order_gate_two_phase_and_idempotent(monkeypatch):
     assert other != key1
 
 
+def test_order_gate_cannot_confirm_within_same_user_turn(monkeypatch):
+    gate = OrderConfirmationGate()
+    monkeypatch.setattr(agent, "get_session", lambda sid: {"user_id": 7})
+    _, first = gate.evaluate("s", 1, "", turn_id="turn-1")
+    _, second = gate.evaluate("s", 1, "", turn_id="turn-1")
+    _, after_new_turn = gate.evaluate("s", 1, "", turn_id="turn-2")
+    assert (first, second, after_new_turn) == ("NEED_CONFIRM", "NEED_CONFIRM", "CONFIRMED")
+
+
 def test_order_gate_different_user_different_key(monkeypatch):
     gate = OrderConfirmationGate()
     monkeypatch.setattr(agent, "get_session", lambda sid: {"user_id": 7})

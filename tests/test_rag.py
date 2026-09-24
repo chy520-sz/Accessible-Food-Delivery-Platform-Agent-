@@ -114,10 +114,13 @@ def test_embedding_parse_validates_count_and_dim():
 
 def test_search_logs_rag_pipeline(monkeypatch, caplog):
     monkeypatch.setattr(kb, "_get_vector_store", lambda _collection: object())
+    # Keep this a pure dense-path unit test regardless of local .env feature flags.
+    monkeypatch.setattr(kb, "RAG_HYBRID_SEARCH_ENABLED", False)
+    monkeypatch.setattr(kb, "RAG_RERANK_ENABLED", False)
     monkeypatch.setattr(
         kb,
         "_similarity_search",
-        lambda _store, _collection, _query, _top_k, rag_id="-": [
+        lambda _store, _collection, _query, _top_k, rag_id="-", filter_expr="": [
             (Document(page_content="命中内容", metadata={"name": "测试菜"}), 0.81),
             (Document(page_content="低分内容", metadata={}), 0.10),
         ],
@@ -133,5 +136,5 @@ def test_search_logs_rag_pipeline(monkeypatch, caplog):
 
     assert "命中内容" in result
     assert "[RAG][test-log] START" in caplog.text
-    assert "[RAG][test-log] FILTER candidates=2 accepted=1" in caplog.text
-    assert "[RAG][test-log] FINISH accepted=1" in caplog.text
+    assert "[RAG][test-log] FILTER mode=DENSE_ONLY candidates=2 accepted=1" in caplog.text
+    assert "[RAG][test-log] FINISH mode=DENSE_ONLY accepted=1" in caplog.text

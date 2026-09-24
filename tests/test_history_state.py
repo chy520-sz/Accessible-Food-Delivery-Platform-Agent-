@@ -27,11 +27,14 @@ def test_clear_conversation_empties_history():
         await ag.aupdate_state(cfg, {"messages": [
             HumanMessage(content="h1", id="h1"),
             AIMessage(content="a1", id="a1"),
-        ]})
+        ], "investigation": {"goal": "旧用户的问题"}})
         assert len((await ag.aget_state(cfg)).values["messages"]) == 2
+        assert (await ag.aget_state(cfg)).values["investigation"]["goal"] == "旧用户的问题"
 
         await agent._clear_conversation(sess)
-        assert len((await ag.aget_state(cfg)).values["messages"]) == 0
+        state = (await ag.aget_state(cfg)).values
+        assert len(state["messages"]) == 0
+        assert state["investigation"] is None
         agent.delete_session(sess.session_id)
 
     _run(scenario())

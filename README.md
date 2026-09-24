@@ -32,6 +32,10 @@ take-out Agent/
 ├─ llm_client.py              # 共享 LLM 单例（streaming=True）
 ├─ config.py                  # 环境变量（含 RAG 全链路配置）
 ├─ knowledge_base.py          # Milvus 检索核心（混合检索+RRF+Rerank+元数据过滤+Query改写）
+├─ long_term_memory.py        # 分类型长期记忆、写入策略、任务检索与清理闭环
+├─ memory_middleware.py       # 按当前任务筛选并注入相关记忆
+├─ execution_trace.py        # 脱敏执行事件轨迹（供评测与运维聚合）
+├─ evaluation/              # 种子评测集、离线评分器、线上指标聚合
 ├─ embedding_client.py        # Qwen Embedding 客户端（带 SQLite 磁盘缓存）
 ├─ rerank_client.py           # 百炼 gte-rerank-v2 Cross-Encoder 精排客户端
 ├─ query_rewriter.py          # Query 改写（多 Query 扩展 / HyDE 假设文档嵌入）
@@ -268,6 +272,55 @@ Stop-Process -Id $agentPid
 | POST | `/agent/voice` | ASR → Agent → TTS 语音对话 |
 | GET | `/agent/health` | 服务、模型和 RAG 状态 |
 | DELETE | `/agent/session/{session_id}` | 删除会话与历史 |
+| GET | `/agent/memories?session_id=...` | 查看当前登录用户的长期记忆 |
+| POST | `/agent/memories` | 按策略写入/更新记忆，外部引用自动进入 RAG 收件箱 |
+| DELETE | `/agent/memories/{id}?session_id=...` | 删除指定长期记忆 |
+| DELETE | `/agent/memories?session_id=...` | 删除当前用户的全部长期记忆 |
+
+## Agent 评估
+
+已接入脱敏执行轨迹，并提供 50 条种子样例、离线规则评分器和基础运行指标聚合。
+评分将完整完成、部分完成、正确失败、错误失败分开统计；安全违规是独立门禁，
+不能由其他高分抵消。轨迹中的 `done` 只表示一轮请求结束，不代表任务完成。
+样例标注、运行命令、隐私约束和当前边界见 [evaluation/README.md](evaluation/README.md)。
+
+## 长期记忆
+
+长期记忆与 LangGraph 短期消息历史分离，并按登录用户隔离：
+
+- `user_preference`：用户明确表达的长期偏好；
+- `user_goal`：可更新的长期目标；
+- `project_background`：完成任务所需的稳定背景；
+- `task_state`：只存于 `session_task_states`，会话删除或过期即清理；
+- `historical_conclusion`：只接受用户明确陈述或工具验证结果；
+- `external_knowledge_reference`：不进入个人记忆，写到 RAG 审核收件箱。
+
+写入策略拒绝密码、令牌与支付凭证；模型推断和敏感个人信息必须先经用户确认。
+检索先识别当前任务，只加载对应类型的少量记忆，并记录使用次数。被新证据推翻的
+历史结论会标记为 `superseded` 并降权。定时维护会清理过期任务状态、降低长期未用
+记忆的权重、自动淘汰极低价值记忆，并最终清除删除标记。
+
+### 排查 state（会话级，不写入长期记忆）
+
+`update_investigation` 将结构化调查板写入 LangGraph 的 `investigation` state，
+模型每次调用前会看到当前进展。可用结构例如：
+
+```json
+{
+  "goal": "定位支付接口变慢原因",
+  "current_hypothesis": "第三方支付回调超时可能导致接口变慢",
+  "confirmed_facts": ["22:10 后 /api/pay P95 从 300ms 升到 3.8s", "22:05 发布了 payment-service v2.3.1"],
+  "rejected_hypotheses": ["数据库慢查询导致接口变慢"],
+  "next_actions": ["检查 v2.3.1 是否改动回调重试逻辑", "查询第三方支付回调错误码分布"],
+  "status": "investigating",
+  "conclusion": ""
+}
+```
+
+同一 `goal` 的已确认事实和已排除假设会增量合并、去重；传入新的 `next_actions`
+会替换旧待办。更换 `goal` 会开启新的调查，避免串案；换账号清空会话时也会清除
+调查板。`confirmed_facts` 必须来自实际工具结果或用户明确提供的信息，模型猜测只放在
+`current_hypothesis`。上例是结构示意，不表示本项目能查询支付服务日志。
 
 本地开发可将 `AGENT_SERVICE_API_KEY` 留空。生产环境应配置该值，并由可信调用方携带 `X-Agent-Key`。
 

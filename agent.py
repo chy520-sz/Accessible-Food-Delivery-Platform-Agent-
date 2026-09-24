@@ -15,20 +15,36 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
-import traceback
 import uuid
-from typing import Optional
+from typing import Annotated, Optional
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
-from langchain_core.messages import HumanMessage, RemoveMessage, ToolMessage
-from langchain_core.tools import tool
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    RemoveMessage,
+    ToolMessage,
+)
+from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
+from execution_trace import TurnTrace, fingerprint
+from evaluation.arguments import arguments_valid
+
+from investigation import InvestigationMiddleware, merge_board, render_board
+from long_term_memory import MemoryPolicyError, MemoryService
+from memory_middleware import LongTermMemoryMiddleware
 
 import backend_client as bc
 from config import (
     AGENT_MAX_TOOL_CALLS,
+    EVAL_TRACE_ENABLED,
+    EVAL_TRACE_PATH,
     AGENT_MAX_MODEL_CALLS,
     AGENT_MESSAGE_WINDOW,
     AGENT_RECURSION_LIMIT,
@@ -36,6 +52,11 @@ from config import (
     JAVA_BASE_URL,
     LLM_HEALTH_TTL,
     LLM_MODEL,
+    MEMORY_DB_PATH,
+    MEMORY_ENABLED,
+    MEMORY_RAG_INBOX_PATH,
+    MEMORY_RETRIEVAL_TOP_K,
+    MEMORY_STALE_DAYS,
     SESSION_EXPIRE_SECONDS,
 )
 from llm_client import (
@@ -108,6 +129,12 @@ from config import RAG_COLLECTION_DIETARY, RAG_COLLECTION_FAQ, RAG_COLLECTION_FO
 # ==================== 进程内 checkpointer ====================
 # 单进程部署：所有会话的短期记忆保存在这里，按 thread_id 隔离。
 _checkpointer = InMemorySaver()
+_memory_service = MemoryService(MEMORY_DB_PATH, MEMORY_RAG_INBOX_PATH)
+
+
+def get_memory_service() -> MemoryService:
+    """Expose the service layer to routers without exposing persistence details."""
+    return _memory_service
 
 
 # ==================== 下单确认闸门（服务端待确认状态） ====================
@@ -125,29 +152,53 @@ class OrderConfirmationGate:
         self._pending: dict[str, dict] = {}
 
     @staticmethod
-    def _idempotency_key(user_id, address_id, remark) -> str:
-        raw = f"{user_id}|{address_id}|{(remark or '').strip()}"
+    def _hash(raw: str) -> str:
         return "agent-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+    @staticmethod
+    def _idempotency_key(user_id, address_id, remark) -> str:
+        # 兼容旧调用：place_order 专用键派生（测试锁定此签名）
+        raw = f"{user_id}|{address_id}|{(remark or '').strip()}"
+        return OrderConfirmationGate._hash(raw)
 
     def _purge(self, now: float) -> None:
         expired = [k for k, v in self._pending.items() if now - v["ts"] > self.TTL_SECONDS]
         for k in expired:
             self._pending.pop(k, None)
 
-    def evaluate(self, session_id: str, address_id: int, remark: str) -> tuple[str, str]:
-        """返回 (幂等键, 阶段)，阶段为 NEED_CONFIRM / CONFIRMED / ALREADY_DONE。"""
+    def evaluate_action(self, session_id: str, action: str, parts: tuple,
+                        turn_id: Optional[str] = None) -> tuple[str, str]:
+        """通用两阶段确认入口：返回 (幂等键, 阶段)。
+
+        action: 操作名（place_order / clear_cart / merchant_accept_order ...）。
+        parts : 归一化后的关键参数元组；相同 parts 视为同一个待确认动作。
+        阶段: NEED_CONFIRM（首次，只生成草稿，不产生副作用）/
+              CONFIRMED（跨轮再次调用；实际用户确认仍需独立核验）/
+              ALREADY_DONE（已提交并缓存结果，幂等复用）。
+        """
         now = time.time()
         self._purge(now)
         sess = get_session(session_id)
         uid = sess.get("user_id", 0) if sess else 0
-        key = self._idempotency_key(uid, address_id, remark)
+        norm = "|".join(
+            str(p).strip() if isinstance(p, str) else str(p) for p in parts
+        )
+        key = self._hash(f"{uid}|{action}|{norm}")
         rec = self._pending.get(key)
         if rec is None:
-            self._pending[key] = {"ts": now, "state": "awaiting"}
+            self._pending[key] = {"ts": now, "state": "awaiting", "turn_id": turn_id}
             return key, "NEED_CONFIRM"
         if rec.get("result") is not None:
             return key, "ALREADY_DONE"
+        # A model may call the same tool twice in one run; that is not user confirmation.
+        if turn_id is not None and rec.get("turn_id") == turn_id:
+            return key, "NEED_CONFIRM"
         return key, "CONFIRMED"
+
+    def evaluate(self, session_id: str, address_id: int, remark: str,
+                 turn_id: Optional[str] = None) -> tuple[str, str]:
+        """place_order 专用两阶段入口（保留旧签名，内部走通用 evaluate_action）。"""
+        return self.evaluate_action(session_id, "place_order", (address_id, remark), turn_id=turn_id)
 
     def store_result(self, key: str, result: str) -> None:
         self._pending[key] = {"ts": time.time(), "state": "done", "result": result}
@@ -172,6 +223,7 @@ class AgentSession:
         self.username = ""
         self.owner_user_id: Optional[object] = None
         self.order_gate = OrderConfirmationGate()
+        self.active_trace: Optional[TurnTrace] = None
         self._lock: Optional[asyncio.Lock] = None
 
     def lock(self) -> asyncio.Lock:
@@ -217,6 +269,8 @@ def _delete_session(session_id: str) -> None:
     """统一清理：会话对象、JWT、checkpoint 线程、待确认订单、锁。"""
     sess = _sessions.pop(session_id, None)
     bc.clear_session(session_id)
+    # Task state is session-scoped. Long-term user memory deliberately survives.
+    _memory_service.clear_session_state(session_id)
     try:
         _checkpointer.delete_thread(session_id)
     except Exception:
@@ -244,6 +298,7 @@ def cleanup_sessions(now: Optional[float] = None) -> int:
     for sid in expired:
         _delete_session(sid)
     bc.purge_expired_sessions(now)
+    _memory_service.maintain(now=now, stale_days=MEMORY_STALE_DAYS)
     if expired:
         logger.info("[session_cleanup] 清理过期会话 %d 个", len(expired))
     return len(expired)
@@ -259,10 +314,12 @@ async def _clear_conversation(sess: AgentSession) -> None:
         state = await sess.agent.aget_state(sess.config())
         msgs = state.values.get("messages", [])
         removes = [RemoveMessage(id=m.id) for m in msgs if getattr(m, "id", None)]
-        if removes:
+        if removes or state.values.get("investigation") is not None:
             # as_node 必须显式指定：model/tools 都会写 messages，
             # 否则 LangGraph 抛 "Ambiguous update"，历史其实清不掉。
-            await sess.agent.aupdate_state(sess.config(), {"messages": removes}, as_node="model")
+            await sess.agent.aupdate_state(
+                sess.config(), {"messages": removes, "investigation": None}, as_node="model"
+            )
             logger.info("[session] 会话 %s 已清空对话历史 %d 条", sess.session_id, len(removes))
     except Exception:
         logger.warning("[session] 清空对话历史失败 session=%s", sess.session_id, exc_info=True)
@@ -386,6 +443,82 @@ def _create_tools(sess: AgentSession):
     """创建绑定到指定会话的工具闭包（LLM 无需感知 session_id）。"""
     session_id = sess.session_id
 
+    def _memory_owner() -> str:
+        stored = get_session(session_id) or {}
+        return str(stored.get("user_id") or sess.owner_user_id or "")
+
+    @tool
+    def remember_context(
+        memory_type: str,
+        key: str,
+        content: str,
+        user_confirmed: bool = False,
+        importance: float = 0.5,
+    ) -> str:
+        """保存用户明确要求记住的信息。
+
+        仅在用户明确表达“记住/以后都这样/保存这个目标”，或用户确认了你的复述时调用。
+        memory_type 必须是 user_preference、user_goal、project_background、task_state、
+        historical_conclusion、external_knowledge_reference 之一。模型推断不得静默保存；
+        敏感信息必须先获得用户确认；密码、令牌、支付凭证永远不能保存。
+        task_state 只在当前会话有效；external_knowledge_reference 会进入 RAG 审核队列。
+        """
+        try:
+            result = _memory_service.write(
+                owner_id=_memory_owner(), session_id=session_id, memory_type=memory_type,
+                key=key, content=content, source="user_explicit",
+                user_confirmed=user_confirmed, importance=importance,
+            )
+            suffix = f"，记忆ID={result.memory.id}" if result.memory else ""
+            if result.rag_reference_id:
+                suffix = f"，RAG引用ID={result.rag_reference_id}"
+            return f"{result.message}{suffix} [code=OK]"
+        except MemoryPolicyError as exc:
+            return f"未保存：{exc} [code=MEMORY_POLICY_REJECTED]"
+
+    @tool
+    def forget_context(memory_id: str) -> str:
+        """用户明确要求忘记某条已保存记忆时，按记忆 ID 删除。不要猜测 ID。"""
+        count = _memory_service.delete(_memory_owner(), memory_id)
+        if count:
+            return "已按用户要求删除该记忆。 [code=OK]"
+        return "没有找到属于当前用户的这条记忆。 [code=NOT_FOUND]"
+
+    @tool
+    def supersede_conclusion(memory_id: str, reason: str) -> str:
+        """旧的历史结论被新证据推翻时，将它标为已过时并降权。仅用于 historical_conclusion。
+
+        memory_id 必须来自当前相关记忆上下文；reason 简述推翻它的新证据。降权后如有新结论，
+        再调用 remember_context 保存新的 historical_conclusion。
+        """
+        count = _memory_service.supersede(_memory_owner(), memory_id, reason)
+        if count:
+            return "旧结论已标记为过时并降权。 [code=OK]"
+        return "没有找到当前用户的有效历史结论。 [code=NOT_FOUND]"
+
+    def _run_draft_action(action: str, parts: tuple, draft_text: str,
+                          exec_fn, success_marker: str) -> str:
+        """高风险操作两阶段执行：
+        - 首次调用：只登记待确认，返回草稿提示（不产生任何副作用）；
+        - 用户确认后第二次相同参数调用：真正执行 exec_fn；
+        - 已成功执行过：幂等返回首次结果。
+        仅当 exec_fn 返回文本含 success_marker 时才缓存结果，失败允许用户修正后重试。
+        """
+        key, phase = sess.order_gate.evaluate_action(
+            session_id, action, parts,
+            turn_id=sess.active_trace.trace_id if sess.active_trace else None,
+        )
+        if sess.active_trace:
+            sess.active_trace.record("guard_action", tool=action, phase=phase, executed=phase == "CONFIRMED")
+        if phase == "NEED_CONFIRM":
+            return draft_text + "\n[code=DRAFT_REQUIRED]"
+        if phase == "ALREADY_DONE":
+            return sess.order_gate.get_result(key)
+        result = exec_fn()
+        if success_marker in result:
+            sess.order_gate.store_result(key, result)
+        return result
+
     @tool
     def login(phone: str, password: str) -> str:
         """用户登录。仅在用户尚未登录或登录已过期时使用。如果用户已经在网页端登录过了，不需要再次调用此工具。
@@ -500,9 +633,20 @@ def _create_tools(sess: AgentSession):
 
     @tool
     def clear_cart() -> str:
-        """清空购物车里的所有菜品。"""
-        sess.order_gate.clear()  # 购物车变化后旧的待确认订单失效
-        return _clear_cart(session_id)
+        """清空购物车里的所有菜品/套餐（高风险，两步确认）。
+        第一次调用只生成草稿、不会真的清空；必须先调用 get_cart 向用户复述购物车内容，
+        用户明确确认后再以相同参数调用一次才会真正清空。"""
+        return _run_draft_action(
+            action="clear_cart",
+            parts=(),
+            draft_text=(
+                "购物车尚未清空，当前处于待用户确认状态。请先调用 get_cart 向用户复述"
+                "购物车里的全部菜品与总价，明确询问'确认清空购物车吗？此操作不可撤销'；"
+                "只有用户明确确认后，再调用一次 clear_cart 才会真正清空。"
+            ),
+            exec_fn=lambda: _clear_cart(session_id),
+            success_marker="已清空",
+        )
 
     @tool
     def get_user_orders() -> str:
@@ -523,7 +667,13 @@ def _create_tools(sess: AgentSession):
         参数 address_id: 收货地址ID数字（先通过 get_user_addresses 获取）
         参数 remark: 订单备注，如"少辣""多加醋"等，可为空
         """
-        key, phase = sess.order_gate.evaluate(session_id, address_id, remark)
+        key, phase = sess.order_gate.evaluate(
+            session_id, address_id, remark,
+            turn_id=sess.active_trace.trace_id if sess.active_trace else None,
+        )
+        if sess.active_trace:
+            sess.active_trace.record("guard_action", tool="place_order", phase=phase,
+                                     executed=phase == "CONFIRMED")
         if phase == "NEED_CONFIRM":
             return (
                 "订单尚未提交，当前处于待用户确认状态。请先向用户完整复述收货地址、备注以及"
@@ -589,27 +739,65 @@ def _create_tools(sess: AgentSession):
 
     @tool
     def merchant_accept_order(order_id: int, user_id: int) -> str:
-        """【真实桥接】商家接单Agent：确认订单并开始备餐，真实调用 Java 后端。
+        """【真实桥接·高风险】商家接单Agent：确认订单并开始备餐（推进订单状态机，不可逆）。
+        第一次调用只生成草稿；向用户/商家侧复述订单号并确认接单后，
+        再以相同 order_id、user_id 调用一次才会真正接单。
         参数 order_id: 订单ID
         参数 user_id: 用户ID
         """
-        return _agent_accept_order(session_id, order_id, user_id)
+        return _run_draft_action(
+            action="merchant_accept_order",
+            parts=(order_id, user_id),
+            draft_text=(
+                f"接单动作尚未执行，当前为草稿。订单ID={order_id}、用户ID={user_id}。"
+                "请先通过 query_order_status 核对订单确实处于待接单状态，"
+                "向商家/用户复述订单号并获得明确确认后，再以相同 order_id、user_id "
+                "调用一次 merchant_accept_order 才会真正接单。"
+            ),
+            exec_fn=lambda: _agent_accept_order(session_id, order_id, user_id),
+            success_marker="已接单",
+        )
 
     @tool
     def delivery_pickup_order(order_id: int, user_id: int) -> str:
-        """【真实桥接】配送Agent：标记订单进入配送状态，真实调用 Java 后端。
+        """【真实桥接·高风险】配送Agent：标记订单进入配送中（推进订单状态机，不可逆）。
+        第一次调用只生成草稿；确认订单已被商家接单后，再以相同参数调用一次才真正配送。
         参数 order_id: 订单ID
         参数 user_id: 用户ID
         """
-        return _agent_start_delivery(session_id, order_id, user_id)
+        return _run_draft_action(
+            action="delivery_pickup_order",
+            parts=(order_id, user_id),
+            draft_text=(
+                f"启动配送动作尚未执行，当前为草稿。订单ID={order_id}、用户ID={user_id}。"
+                "请先用 query_order_status 确认订单已被商家接单，"
+                "确认骑手已取餐后，再以相同 order_id、user_id 调用一次 "
+                "delivery_pickup_order 才会真正进入配送中。"
+            ),
+            exec_fn=lambda: _agent_start_delivery(session_id, order_id, user_id),
+            success_marker="配送",
+        )
 
     @tool
     def delivery_complete_order(order_id: int, user_id: int) -> str:
-        """【真实桥接】配送Agent：订单已送达，真实调用 Java 后端。
+        """【真实桥接·高风险】配送Agent：标记订单已送达完成（触发交易完结，不可逆）。
+        第一次调用只生成草稿；确认骑手已把餐品交到用户手中后，
+        再以相同参数调用一次才真正标记完成。
         参数 order_id: 订单ID
         参数 user_id: 用户ID
         """
-        return _agent_complete_order(session_id, order_id, user_id)
+        return _run_draft_action(
+            action="delivery_complete_order",
+            parts=(order_id, user_id),
+            draft_text=(
+                f"完成配送动作尚未执行，当前为草稿。订单ID={order_id}、用户ID={user_id}。"
+                "请先用 query_order_status 确认订单确实在配送中，"
+                "确认已实际送达用户后，再以相同 order_id、user_id 调用一次 "
+                "delivery_complete_order 才会真正标记为已完成。"
+            ),
+            exec_fn=lambda: _agent_complete_order(session_id, order_id, user_id),
+            success_marker="送达",
+        )
 
     @tool
     def query_order_status(order_id: int) -> str:
@@ -790,7 +978,58 @@ def _create_tools(sess: AgentSession):
         """
         return _get_diet_plan_history(session_id, limit)
 
+    # ==================== 问题排查调查板 ====================
+
+    @tool
+    def update_investigation(
+        goal: str,
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        state: Annotated[dict, InjectedState],
+        current_hypothesis: Optional[str] = None,
+        confirmed_facts: Optional[list[str]] = None,
+        rejected_hypotheses: Optional[list[str]] = None,
+        next_actions: Optional[list[str]] = None,
+        status: Optional[str] = None,
+        conclusion: Optional[str] = None,
+    ) -> Command:
+        """更新"问题排查调查板"。仅在排查异常类问题时使用：用户反馈下单失败、订单卡住、
+        一直没送到、金额/扣款不对、登录失败等"为什么/怎么没反应"的问题。
+        正常点餐流程（搜菜、加购、下单、查进度）不要调用本工具。
+        排查方法：先提出最可能原因，再调用查询工具（get_cart / get_user_orders /
+        query_order_status / get_user_addresses / get_shop_status 等）核实，
+        把坐实的写入 confirmed_facts、被证伪的写入 rejected_hypotheses，
+        每有进展就更新一次；同一目标下 confirmed_facts/rejected_hypotheses 会追加去重，
+        未传入的字段会保留，next_actions 传入时替换为当前待办；换目标则自动重置旧调查。
+        仅把工具或用户实际证实的信息放入 confirmed_facts，假设放在 current_hypothesis。
+        定位根因后把 status 置为 resolved 并填写 conclusion。
+        参数 goal: 一句话排查目标，如"定位用户下单失败原因"
+        参数 current_hypothesis: 当前最可能的原因
+        参数 confirmed_facts: 已被工具结果证实的事实列表
+        参数 rejected_hypotheses: 已排除的猜测列表，避免重复怀疑
+        参数 next_actions: 下一步要验证或查询的事项列表
+        参数 status: investigating=排查中，resolved=已定位
+        参数 conclusion: 定位后的结论，status=resolved 时填写
+        """
+        board = merge_board(
+            state.get("investigation"),
+            goal=goal,
+            current_hypothesis=current_hypothesis,
+            confirmed_facts=confirmed_facts,
+            rejected_hypotheses=rejected_hypotheses,
+            next_actions=next_actions,
+            status=status,
+            conclusion=conclusion,
+        )
+        return Command(update={
+            "investigation": board,
+            "messages": [ToolMessage(
+                content="调查板已更新：\n" + render_board(board),
+                tool_call_id=tool_call_id,
+            )],
+        })
+
     return [
+        remember_context, forget_context, supersede_conclusion,
         login, search_dishes, get_dish_detail, search_combos, get_combo_detail,
         recommend_dishes, rate_item,
         get_my_rating_history, get_cart, add_to_cart, add_combo_to_cart, clear_cart,
@@ -801,7 +1040,7 @@ def _create_tools(sess: AgentSession):
         search_food_knowledge, search_dietary_knowledge, search_faq,
         record_health_profile, check_health_profile, record_weight,
         view_weight_history, generate_diet_plan, view_diet_plan,
-        view_diet_plan_history,
+        view_diet_plan_history, update_investigation,
     ]
 
 
@@ -825,6 +1064,14 @@ def _build_agent(sess: AgentSession):
                 run_limit=AGENT_MAX_TOOL_CALLS,
                 exit_behavior="continue",
             ),
+            # 每轮模型调用前把问题排查调查板注入系统提示
+            InvestigationMiddleware(),
+            *([LongTermMemoryMiddleware(
+                _memory_service,
+                owner_resolver=lambda: str((get_session(sess.session_id) or {}).get("user_id") or ""),
+                session_id=sess.session_id,
+                top_k=MEMORY_RETRIEVAL_TOP_K,
+            )] if MEMORY_ENABLED else []),
         ],
     )
 
@@ -1002,6 +1249,37 @@ def _extract_chunk_text(chunk) -> str:
     return _content_to_text(getattr(chunk, "content", ""))
 
 
+_SENSITIVE_RE = re.compile(r"(password|passwd|phone|mobile|token|secret|凭证|密码)", re.IGNORECASE)
+_TOOL_CODE_RE = re.compile(r"\[code=([A-Z_]+)\]")
+
+
+def _mask_tool_args(args) -> dict:
+    """脱敏工具入参：密码/手机号/token 等字段名命中则打码，不进日志。"""
+    if not isinstance(args, dict):
+        return {"_raw": str(args)[:200]}
+    out = {}
+    for k, v in args.items():
+        out[k] = "***" if _SENSITIVE_RE.search(str(k)) else v
+    return out
+
+
+def _tool_failure_code(chunk) -> str:
+    """判定工具结果是否为失败，返回错误码；非失败返回空串。
+
+    失败来源：
+      1) 工具抛异常（is_error=True）；
+      2) 工具走统一错误码体系，返回文本带 [code=XXX] 且不是 OK。
+    """
+    body = _content_to_text(getattr(chunk, "content", ""))
+    if getattr(chunk, "is_error", False):
+        m = _TOOL_CODE_RE.search(body)
+        return m.group(1) if m else "EXCEPTION"
+    m = _TOOL_CODE_RE.search(body)
+    if m and m.group(1) != "OK":
+        return m.group(1)
+    return ""
+
+
 def _friendly_error(trace_id: str, error_msg: str) -> str:
     error_lower = error_msg.lower()
     if "timeout" in error_lower or "timed out" in error_lower:
@@ -1046,9 +1324,13 @@ async def stream_chat(
     trace_id = uuid.uuid4().hex[:12]
     is_new = session_id is None
     sess = None
+    turn_trace = None
+    model_steps = 0
+    tool_calls = 0
 
     try:
         sess = get_or_create_session(session_id)
+        turn_trace = TurnTrace(trace_id, EVAL_TRACE_PATH, EVAL_TRACE_ENABLED)
         yield {
             "type": "session",
             "session_id": sess.session_id,
@@ -1057,15 +1339,17 @@ async def stream_chat(
         }
 
         async with sess.lock():  # 同一会话串行
+            sess.active_trace = turn_trace
             sess.last_active = time.time()
             await _reconcile_auth(sess, auth_token)
 
             logger.info(
-                "[chat] trace=%s session=%s logged_in=%s username=%s input=%s",
-                trace_id, sess.session_id, sess.logged_in, sess.username, user_input[:80]
+                "[chat] trace=%s session=%s logged_in=%s input_chars=%d",
+                trace_id, sess.session_id, sess.logged_in, len(user_input)
             )
 
             if not sess.logged_in:
+                turn_trace.finish("auth_required")
                 yield {"type": "delta", "text": NOT_LOGGED_IN_REPLY}
                 yield {
                     "type": "done",
@@ -1083,12 +1367,54 @@ async def stream_chat(
             await _prepare_history(sess)
 
             chunks: list[str] = []
+            # 关联 AI 要调的工具入参与工具结果：tool_call_id -> (name, args)
+            pending_calls: dict[str, tuple[str, dict]] = {}
+            seen_calls: set[str] = set()
+            seen_model_messages: set[str] = set()
             async with asyncio.timeout(AGENT_TOTAL_TIMEOUT_SECONDS):
                 async for chunk, _meta in agent.astream(
                     {"messages": [HumanMessage(content=user_input)]},
                     cfg,
                     stream_mode="messages",
                 ):
+                    # 记录 AI 发起的工具调用及其参数
+                    if isinstance(chunk, (AIMessage, AIMessageChunk)):
+                        message_id = getattr(chunk, "id", None) or str(_meta.get("langgraph_step", ""))
+                        if message_id and message_id not in seen_model_messages:
+                            seen_model_messages.add(message_id)
+                            model_steps += 1
+                            turn_trace.record("model_step")
+                        for tc in (getattr(chunk, "tool_calls", None) or []):
+                            call_id = tc.get("id")
+                            name = tc.get("name", "?")
+                            args = tc.get("args", {})
+                            if call_id and name and name != "?":
+                                pending_calls[call_id] = (name, args)
+                                if call_id not in seen_calls:
+                                    seen_calls.add(call_id)
+                                    tool_calls += 1
+                                    turn_trace.record("tool_call", tool=name, tool_call_id=call_id,
+                                                      args_fingerprint=fingerprint(args))
+                    # 工具结果：失败时打结构化审计日志（原始错误不念给用户）
+                    elif isinstance(chunk, ToolMessage):
+                        name, args = pending_calls.get(getattr(chunk, "tool_call_id", ""), ("?", {}))
+                        call_id = getattr(chunk, "tool_call_id", "")
+                        if call_id and call_id not in seen_calls:
+                            name = getattr(chunk, "name", None) or name
+                            seen_calls.add(call_id)
+                            tool_calls += 1
+                            turn_trace.record("tool_call", tool=name, tool_call_id=call_id,
+                                              args_fingerprint=fingerprint(args))
+                        code = _tool_failure_code(chunk)
+                        turn_trace.record("tool_result", tool=name,
+                                          tool_call_id=call_id,
+                                          error_code=code or "OK",
+                                          args_valid=arguments_valid(name, args) if name != "?" else None)
+                        if code:
+                            logger.warning(
+                                "[tool_fail] trace=%s session=%s tool=%s code=%s args_fingerprint=%s",
+                                trace_id, sess.session_id, name, code, fingerprint(args),
+                            )
                     text = _extract_chunk_text(chunk)
                     if not text:
                         continue
@@ -1100,6 +1426,7 @@ async def stream_chat(
                 reply = _EMPTY_REPLY_FALLBACK
                 yield {"type": "delta", "text": reply}
             mark_llm_success()
+            turn_trace.finish("done", model_steps, tool_calls)
             yield {
                 "type": "done",
                 "session_id": sess.session_id,
@@ -1111,6 +1438,8 @@ async def stream_chat(
 
     except TimeoutError:
         mark_llm_failure()
+        if turn_trace:
+            turn_trace.finish("timeout", model_steps, tool_calls)
         logger.error("[chat] trace=%s 总耗时超过 %.0fs", trace_id, AGENT_TOTAL_TIMEOUT_SECONDS)
         yield {
             "type": "error",
@@ -1120,16 +1449,20 @@ async def stream_chat(
         }
     except Exception as e:
         mark_llm_failure()
-        logger.error(
-            "[chat] trace=%s session=%s ERROR type=%s msg=%s\n%s",
-            trace_id, session_id or "(new)", type(e).__name__, str(e), traceback.format_exc(),
-        )
+        if turn_trace:
+            turn_trace.finish("error", model_steps, tool_calls)
+        logger.error("[chat] trace=%s ERROR type=%s", trace_id, type(e).__name__)
         yield {
             "type": "error",
             "message": _friendly_error(trace_id, str(e)),
             "session_id": sess.session_id if sess else (session_id or ""),
             "trace_id": trace_id,
         }
+    finally:
+        if turn_trace:
+            turn_trace.finish("interrupted", model_steps, tool_calls)
+        if sess is not None and sess.active_trace is turn_trace:
+            sess.active_trace = None
 
 
 async def chat(session_id: Optional[str], user_input: str, auth_token: Optional[str] = None) -> dict:
